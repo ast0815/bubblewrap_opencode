@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# opencode-sandbox – final, perfect, easy-to-maintain version (2025)
+
+set -eo pipefail
+
+TARGET_EXECUTABLE="$(which opencode)"
+
+if [ ! -f "${TARGET_EXECUTABLE}" ]; then
+    echo "Could not find opencode executable!"
+fi
+
+# Save current-folder as that will be mapped in as read-write and the current folder we execute in.
+CURRENT_FOLDER=${PWD}
+
+# Resolve the real binary path (follows alternatives, flatpak, etc.)
+REAL_COMMAND="$(readlink -f "$TARGET_EXECUTABLE")"
+
+# Build the full bwrap argument array
+bwrap_args=(
+    bwrap
+
+    # Drop as many privilieges as possible
+    --unshare-all
+
+    # But allow network access
+    --share-net
+
+    # Start a fresh session
+    --new-session
+    --die-with-parent
+
+    # Mount the whole file system read-only
+    --ro-bind   / /
+
+    # Add dev and proc special binds
+    --dev /dev
+    --proc /proc
+
+    # Add some temporary file systems
+    --tmpfs /tmp
+
+    # Access to necessary caches etc
+    --bind-try "${HOME}/.bun" "${HOME}/.bun"
+    --bind-try "${HOME}/.cache/opencode" "${HOME}/.cache/opencode"
+    --bind-try "${HOME}/.local/share/opencode" "${HOME}/.local/share/opencode"
+    --bind-try "${HOME}/.local/state/opencode" "${HOME}/.local/state/opencode"
+    --bind-try "${XDG_CACHE_HOME}/opencode" "${XDG_CACHE_HOME}/opencode"
+
+    # Make the current directory writable
+    --bind "${CURRENT_FOLDER}" "${CURRENT_FOLDER}"
+)
+
+exec "${bwrap_args[@]}" -- "$REAL_COMMAND" "$@"
+
