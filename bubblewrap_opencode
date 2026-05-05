@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# opencode-sandbox – final, perfect, easy-to-maintain version (2025)
-
+:
 set -eo pipefail
 
 TARGET_EXECUTABLE="$(which opencode)"
@@ -38,6 +37,12 @@ bwrap_args=(
 
     # Add some temporary file systems
     --tmpfs /tmp
+
+    # SSH doesn't like the "nobody" ownership of ro files
+    # Hide global ssh config
+    --tmpfs /etc/ssh/
+    # Also, it might need to create files here
+    --bind-try "${HOME}/.ssh" "${HOME}/.ssh"
 
     # Access to necessary caches etc
     --bind-try "${HOME}/.bun" "${HOME}/.bun"
