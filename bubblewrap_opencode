@@ -46,7 +46,7 @@ bwrap_args=(
 
     # Access to necessary caches etc
     --bind-try "${HOME}/.bun" "${HOME}/.bun"
-    --bind-try "${HOME}/.cache/opencode" "${HOME}/.cache/opencode"
+    --bind-try "${HOME}/.cache" "${HOME}/.cache"
     --bind-try "${HOME}/.local/share/opencode" "${HOME}/.local/share/opencode"
     --bind-try "${HOME}/.local/state/opencode" "${HOME}/.local/state/opencode"
     --bind-try "${XDG_CACHE_HOME}/opencode" "${XDG_CACHE_HOME}/opencode"
