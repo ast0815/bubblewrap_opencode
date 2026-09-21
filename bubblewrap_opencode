@@ -55,5 +55,13 @@ bwrap_args=(
     --bind "${CURRENT_FOLDER}" "${CURRENT_FOLDER}"
 )
 
-exec "${bwrap_args[@]}" -- "$REAL_COMMAND" "$@"
+# For v2+, run with a private server so the host-wide background service
+# is not touched (other opencode sessions stay running) and the sandbox
+# actually contains the server instead of having the client delegate to a
+# service running outside the bwrap.
+standalone_arg=()
+if "$REAL_COMMAND" --version 2>/dev/null | grep -qE 'v[2-9]\.'; then
+    standalone_arg=(--standalone)
+fi
 
+exec "${bwrap_args[@]}" -- "$REAL_COMMAND" "${standalone_arg[@]}" "$@"
