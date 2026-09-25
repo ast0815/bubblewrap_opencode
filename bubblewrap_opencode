@@ -2,10 +2,11 @@
 
 set -eo pipefail
 
-TARGET_EXECUTABLE="$(which opencode)"
+TARGET_EXECUTABLE="$(command -v opencode || true)"
 
-if [ ! -f "${TARGET_EXECUTABLE}" ]; then
-    echo "Could not find opencode executable!"
+if [ -z "${TARGET_EXECUTABLE}" ] || [ ! -x "${TARGET_EXECUTABLE}" ]; then
+    echo "bubblewrap_opencode: could not find an opencode executable on PATH" >&2
+    exit 1
 fi
 
 # Save current-folder as that will be mapped in as read-write and the current folder we execute in.
@@ -14,10 +15,14 @@ CURRENT_FOLDER=${PWD}
 # Resolve the real binary path (follows alternatives, flatpak, etc.)
 REAL_COMMAND="$(readlink -f "$TARGET_EXECUTABLE")"
 
-# An unset variable must never silently become a bogus --bind-try target.
+# An unset variable must never silently become a bogus bind target, and the
+# value has to be exported as well as used: opencode resolves its own cache from
+# the environment, so binding one directory while the tools look in another
+# would leave the writable cache unused.
 : "${HOME:=/home/$(id -un)}"
 : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
 : "${XDG_CACHE_HOME:=${HOME}/.cache}"
+export XDG_CACHE_HOME
 XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR%/}"
 
 # --- Persistent state, one directory per repo -------------------------------
@@ -37,6 +42,7 @@ for base in "${OPENCODE_SANDBOX_HOME:-${HOME}/.local/share/opencode-sbx}" \
             "${TMPDIR:-/tmp}/opencode-sbx"; do
     if mkdir -p "${base}/${SBX_KEY}/data/opencode" "${base}/${SBX_KEY}/state" 2>/dev/null; then
         SBX="${base}/${SBX_KEY}"
+        SBX_PARENT="${base}"
         [ "${base}" = "${OPENCODE_SANDBOX_HOME:-${HOME}/.local/share/opencode-sbx}" ] || \
             echo "bubblewrap_opencode: home is not writable, using ${SBX}" >&2
         break
@@ -208,12 +214,12 @@ bwrap_args=(
     # server's service.json, ~900M of session history) and all of ~/.ssh, so
     # --ro-bind / / does not leave key material readable. The sandbox uses the
     # per-repo copy below instead.
-    "${hide_dirs[@]}"
+    ${hide_dirs[@]+"${hide_dirs[@]}"}
 
     # Belt and braces: the credential paths are not writable either, so nothing
     # can plant a plausible auth.json even in the empty tmpfs above. A 0-byte
     # read-only file: reads see nothing, writes fail, host copies untouched.
-    "${mask_args[@]}"
+    ${mask_args[@]+"${mask_args[@]}"}
 
     # This repo's persistent session state, plus the package-manager caches
     # the read-only host toolchains cannot use (see the exports above).
@@ -232,7 +238,7 @@ bwrap_args=(
     # SSH: no key material, ever. ~/.ssh is one of the tmpfs mounts above, so
     # private keys, config and known_hosts are gone. Agent forwarding, when
     # enabled, is bound in *after* the mask, so the socket survives it.
-    "${ssh_args[@]}"
+    ${ssh_args[@]+"${ssh_args[@]}"}
 
     # Toolchains: read-only. These are on the host PATH, so a writable bind here
     # is a code-execution path into every later, possibly unsandboxed, shell.
@@ -248,10 +254,17 @@ bwrap_args=(
     --bind "${CURRENT_FOLDER}" "${CURRENT_FOLDER}"
 )
 
-# The host's desktop/secret services are unreachable above, so stop advertising
-# them. Otherwise tools block for seconds trying to connect to sockets that are
-# gone, or pop dialogs on the host desktop.
-unset DBUS_SESSION_BUS_ADDRESS DISPLAY WAYLAND_DISPLAY XAUTHORITY ICEAUTHORITY PAM_KWALLET5_LOGIN
+# The host's desktop and secret services are unreachable above, so stop
+# advertising them. Left in place, tools block for seconds trying to connect to
+# sockets that no longer exist, or try to raise a dialog on the host desktop.
+# The XDG_SESSION_* and XDG_SEAT* values are likewise just pointers to that
+# desktop; XDG_CONFIG_DIRS and XDG_DATA_DIRS are kept, since those point at
+# readable system configuration the tools genuinely use.
+unset DBUS_SESSION_BUS_ADDRESS DISPLAY WAYLAND_DISPLAY XAUTHORITY ICEAUTHORITY \
+      PAM_KWALLET5_LOGIN XDG_ACTIVATION_TOKEN XDG_CURRENT_DESKTOP \
+      XDG_MENU_PREFIX XDG_SEAT XDG_SEAT_PATH XDG_SESSION_CLASS \
+      XDG_SESSION_DESKTOP XDG_SESSION_ID XDG_SESSION_PATH \
+      XDG_SESSION_TYPE XDG_VTNR
 
 # Escape hatch: run an arbitrary command inside exactly the sandbox opencode
 # would get, instead of opencode itself. Used by sandbox-selftest and handy for
@@ -266,13 +279,54 @@ fi
 # actually contains the server instead of having the client delegate to a
 # service running outside the bwrap.
 #
-# `serve` is the server itself and rejects the flag, so pass its args through
-# untouched. Everything else (bare TUI, run, attach, ...) accepts it.
-standalone_arg=()
-if [ "$#" -gt 0 ] && [ "$1" = "serve" ]; then
-    standalone_arg=()
-elif "$REAL_COMMAND" --version 2>/dev/null | grep -qE 'v[2-9]\.'; then
-    standalone_arg=(--standalone)
-fi
+# Two things about this flag are easy to get wrong, and both were wrong here:
+#
+#   - It belongs *after* the subcommand. `opencode --standalone models` is
+#     rejected and prints help; `opencode models --standalone` works.
+#   - It only exists on the commands that talk to a server (the bare TUI, run,
+#     api, models, stats, mini, reload). Handing it to serve, session, auth,
+#     debug, mcp, plugin, upgrade, uninstall, service, acp or pair makes opencode
+#     print its help and do nothing.
+#
+# Which commands those are changes between releases, so ask the binary rather
+# than hardcode a list, and cache the answer per version because each question
+# costs a process start.
+OPENCODE_VERSION="$("$REAL_COMMAND" --version 2>/dev/null || true)"
+case "$OPENCODE_VERSION" in
+    *v[2-9].*) want_standalone=1 ;;
+    *)           want_standalone=0 ;;
+esac
 
-exec "${bwrap_args[@]}" -- "$REAL_COMMAND" "${standalone_arg[@]}" "$@"
+opencode_args=("$REAL_COMMAND")
+if [ "$want_standalone" = 1 ]; then
+    if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
+        sub=$1
+        flag_cache="${SBX_PARENT}/.standalone-flags"
+        key="${OPENCODE_VERSION} ${sub}"
+        verdict=""
+        if [ -r "${flag_cache}" ]; then
+            case "$(grep -m1 -F "${key} " "${flag_cache}" 2>/dev/null)" in
+                " ${key} yes") verdict=yes ;;
+                " ${key} no")  verdict=no ;;
+            esac
+        fi
+        if [ -z "$verdict" ]; then
+            if "$REAL_COMMAND" "$sub" --help 2>&1 | sed -n '/^FLAGS/,/^GLOBAL/p' \
+                 | grep -q -- '--standalone'; then
+                verdict=yes
+            else
+                verdict=no
+            fi
+            printf '%s %s\n' "$key" "$verdict" >> "${flag_cache}" 2>/dev/null || true
+        fi
+        opencode_args+=("$sub")
+        shift
+        [ "$verdict" = yes ] && opencode_args+=(--standalone)
+    else
+        # No subcommand: this is the TUI, which does accept the flag.
+        opencode_args+=(--standalone)
+    fi
+fi
+opencode_args+=("$@")
+
+exec "${bwrap_args[@]}" -- "${opencode_args[@]}"
