@@ -279,30 +279,48 @@ fi
 # actually contains the server instead of having the client delegate to a
 # service running outside the bwrap.
 #
-# Two things about this flag are easy to get wrong, and both were wrong here:
+# Three things about this flag are easy to get wrong, and all three were wrong
+# here:
 #
-#   - It belongs *after* the subcommand. `opencode --standalone models` is
-#     rejected and prints help; `opencode models --standalone` works.
-#   - It only exists on the commands that talk to a server (the bare TUI, run,
-#     api, models, stats, mini, reload). Handing it to serve, session, auth,
-#     debug, mcp, plugin, upgrade, uninstall, service, acp or pair makes opencode
-#     print its help and do nothing.
+#   - It belongs *after* the subcommand path. `opencode --standalone models`
+#     is rejected and prints help; `opencode models --standalone` works.
+#   - It is not accepted by every command. serve, session, auth, debug, mcp,
+#     plugin, upgrade, uninstall, service, acp and pair make opencode print its
+#     help and do nothing.
+#   - Acceptance is per *leaf* command, not per top-level one: `session` has no
+#     such flag, but `session list` does.
 #
-# Which commands those are changes between releases, so ask the binary rather
-# than hardcode a list, and cache the answer per version because each question
-# costs a process start.
+# So the argument list is split into the subcommand path and the rest, the
+# binary is asked whether that exact path accepts the flag, and the answer is
+# cached per version because each question costs a process start.
 OPENCODE_VERSION="$("$REAL_COMMAND" --version 2>/dev/null || true)"
 case "$OPENCODE_VERSION" in
     *v[2-9].*) want_standalone=1 ;;
     *)           want_standalone=0 ;;
 esac
 
+# The leading run of non-flag arguments is the subcommand path. Anything longer
+# than three words is a command's own arguments (`run "some long message"`), so
+# fall back to the first word alone rather than splitting a message in half.
+path=()
+if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
+    for a in "$@"; do
+        [ "${a#-}" = "$a" ] || break
+        path+=("$a")
+    done
+    if [ "${#path[@]}" -gt 3 ]; then
+        path=("${path[0]}")
+    fi
+fi
+
 opencode_args=("$REAL_COMMAND")
 if [ "$want_standalone" = 1 ]; then
-    if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
-        sub=$1
+    if [ "${#path[@]}" -eq 0 ]; then
+        # No subcommand at all: this is the TUI, which does accept the flag.
+        opencode_args+=(--standalone)
+    else
         flag_cache="${SBX_PARENT}/.standalone-flags"
-        key="${OPENCODE_VERSION} ${sub}"
+        key="${OPENCODE_VERSION} ${path[*]}"
         verdict=""
         if [ -r "${flag_cache}" ]; then
             case "$(grep -m1 -F "${key} " "${flag_cache}" 2>/dev/null)" in
@@ -311,22 +329,30 @@ if [ "$want_standalone" = 1 ]; then
             esac
         fi
         if [ -z "$verdict" ]; then
-            if "$REAL_COMMAND" "$sub" --help 2>&1 | sed -n '/^FLAGS/,/^GLOBAL/p' \
-                 | grep -q -- '--standalone'; then
+            if "$REAL_COMMAND" "${path[@]}" --help 2>&1 \
+                 | sed -n '/^FLAGS/,/^GLOBAL/p' | grep -q -- '--standalone'; then
                 verdict=yes
             else
                 verdict=no
             fi
             printf '%s %s\n' "$key" "$verdict" >> "${flag_cache}" 2>/dev/null || true
         fi
-        opencode_args+=("$sub")
-        shift
-        [ "$verdict" = yes ] && opencode_args+=(--standalone)
-    else
-        # No subcommand: this is the TUI, which does accept the flag.
-        opencode_args+=(--standalone)
+        opencode_args+=("${path[@]}")
+        if [ "$verdict" = yes ]; then
+            opencode_args+=(--standalone)
+        fi
     fi
 fi
-opencode_args+=("$@")
+# Everything after the subcommand path. ${@:N} is 1-based in bash (and ${@:0}
+# is the special "all arguments" case), so dropping len(path) arguments needs
+# len(path)+1. The offset is computed in a variable on purpose: a nested
+# ${#path[@]} inside the slice is mis-parsed and silently yields the wrong
+# arguments.
+if [ "${#path[@]}" -gt 0 ]; then
+    skip=$((${#path[@]} + 1))
+    opencode_args+=("${@:$skip}")
+else
+    opencode_args+=("$@")
+fi
 
 exec "${bwrap_args[@]}" -- "${opencode_args[@]}"
