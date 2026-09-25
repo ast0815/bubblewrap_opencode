@@ -98,6 +98,23 @@ bwrap_args=(
     # But allow network access
     --share-net
 
+    # A process inside must not be able to build a *second* sandbox. Inside a
+    # user namespace, unshare(CLONE_NEWUSER) is otherwise free, which hands a
+    # compromised agent a fresh privileged mount namespace to work with.
+    # --disable-userns installs a seccomp filter that makes any attempt fail
+    # with ENOSPC, and sets no_new_privs. It insists on seeing --unshare-user
+    # explicitly, so state it even though --unshare-all already implies it.
+    --unshare-user
+    --disable-userns
+
+    # Nothing inside needs any capability; several tools also refuse to start
+    # when they see an empty bounding set, so this is also a sanity signal.
+    --cap-drop ALL
+
+    # A distinctive hostname makes it obvious in ps/top/screenshots that a
+    # process is sandboxed rather than a normal one.
+    --hostname opencode-sandbox
+
     # Start a fresh session
     --new-session
     --die-with-parent
