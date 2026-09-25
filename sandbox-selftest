@@ -108,14 +108,20 @@ if [ "$WHICH" = all ] || [ "$WHICH" = functional ]; then
     rm -f ./.selftest-probe /tmp/.selftest-probe 2>/dev/null
 
     printf '\n  %sbounds that are writable from inside%s\n' "$BOLD" "$OFF"
+    # Writable is only a problem when the write lands on a real host filesystem.
+    # A tmpfs is writable but empty and discarded when the sandbox exits.
     for d in "$HOME/.bun" "$HOME/.local/share/uv/tools" "$HOME/.local/state/opencode" \
-             "$HOME/.local/share/opencode" "$HOME/.cache"; do
+             "$HOME/.local/share/opencode" "$HOME/.cache" "$HOME/.ssh"; do
         [ -e "$d" ] || continue
-        if touch "$d/.selftest-probe" 2>/dev/null; then
-            rm -f "$d/.selftest-probe"; printf '    %swritable%s   %s\n' "$YELLOW" "$OFF" "$d"
-        else
-            printf '    %sro%s        %s\n' "$GREEN" "$OFF" "$d"
+        if ! touch "$d/.selftest-probe" 2>/dev/null; then
+            printf '    %sro        %s\n' "$GREEN" "$OFF" "$d"
+            continue
         fi
+        rm -f "$d/.selftest-probe" 2>/dev/null
+        case "$(stat -f -c %T "$d" 2>/dev/null)" in
+            tmpfs) printf '    %stmpfs      %s  (writable, but empty and ephemeral)%s\n' "$YELLOW" "$d" "$OFF" ;;
+            *)     printf '    %sWRITABLE   %s  <-- writes reach the host%s\n' "$RED" "$d" "$OFF" ;;
+        esac
     done
     [ -n "${SSH_AUTH_SOCK:-}" ] && printf '    SSH_AUTH_SOCK=%s\n' "$SSH_AUTH_SOCK"
 fi
@@ -169,17 +175,32 @@ n=libc.process_vm_readv(1,ctypes.byref(l),1,ctypes.byref(r),1,0)
 print('bytes',n,'errno',ctypes.get_errno())
 raise SystemExit(0 if n==16 else 1)"
 
-    section "HOST FILES (must not be readable)"
+    section "HOST FILES (host content must not leak in)"
+    # A 0-byte mask is openable but empty, so "can I read bytes" is the test,
+    # not "does open() succeed". Non-empty here = host content leaked.
     for f in "$HOME/.local/state/opencode/service.json" \
              "$HOME/.local/share/opencode/auth.json" \
              "$HOME/.local/share/opencode/mcp-auth.json" \
+             "$HOME/.local/share/opencode/account.json" \
+             "$HOME/.local/share/opencode/opencode.db" \
              "$HOME/.ssh/id_ed25519" "$HOME/.ssh/config"; do
         if [ ! -e "$f" ]; then
             printf '  %s[ n/a ]%s  %s (not on host)\n' "$DIM" "$OFF" "$f"
         elif [ ! -r "$f" ]; then
-            closed "unreadable  $f"
+            closed "unreadable    $f"
+        elif [ ! -s "$f" ]; then
+            closed "empty mask   $f"
         else
-            open_ "readable    $f"
+            open_ "READABLE     $f  ($(stat -c %s "$f") bytes)"
+        fi
+    done
+
+    # The per-repo copy is the one that must be readable and non-empty.
+    for f in auth.json; do
+        if [ -s "${XDG_DATA_HOME:-/nonexistent}/opencode/$f" ]; then
+            ok "seeded per-repo copy: ${XDG_DATA_HOME}/opencode/$f ($(stat -c %s "${XDG_DATA_HOME}/opencode/$f") bytes)"
+        else
+            bad "no usable per-repo copy of $f in ${XDG_DATA_HOME}/opencode/"
         fi
     done
 
