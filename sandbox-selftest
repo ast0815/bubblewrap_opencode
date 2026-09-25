@@ -16,6 +16,7 @@
 # Usage:  ./sandbox-selftest              all sections
 #         ./sandbox-selftest security     escape channels only
 #         ./sandbox-selftest functional  usability only
+#         ./sandbox-selftest toolchains  package-manager writes (slow)
 
 set -uo pipefail
 
@@ -124,6 +125,34 @@ if [ "$WHICH" = all ] || [ "$WHICH" = functional ]; then
         esac
     done
     [ -n "${SSH_AUTH_SOCK:-}" ] && printf '    SSH_AUTH_SOCK=%s\n' "$SSH_AUTH_SOCK"
+fi
+
+# ---------------------------------------------------------------- toolchains
+# Slow (downloads packages) but the most honest functionality test there is:
+# a read-only package cache looks fine until you try to install into it.
+if [ "$WHICH" = all ] || [ "$WHICH" = toolchains ]; then
+    section "TOOLCHAIN WRITES (each must land in the sandbox, not the host)"
+
+    printf '    %sBUN_INSTALL_CACHE_DIR=%s\n' "$DIM" "${BUN_INSTALL_CACHE_DIR:-<unset>}"
+    printf '    %snpm_config_cache=%s\n'       "$DIM" "${npm_config_cache:-<unset>}"
+    printf '    %sUV_CACHE_DIR=%s\n'           "$DIM" "${UV_CACHE_DIR:-<unset>}"
+    printf '    %sPIP_CACHE_DIR=%s\n'          "$DIM" "${PIP_CACHE_DIR:-<unset>}"
+
+    W=/tmp/.selftest-pkgs; rm -rf "$W"; mkdir -p "$W"
+    run "npm install + require" - bash -c "cd '$W' && npm install --silent --no-audit --no-fund is-odd >/dev/null && node -e \"require('is-odd')\""
+    run "bun add + import"     - bash -c "cd '$W' && bun add --silent left-pad >/dev/null && bun -e \"import p from 'left-pad'; p('x',2)\""
+    run "uvx runs a package"   - bash -c "uvx --quiet cowsay -t moo >/dev/null"
+    run "uv tool install"      - bash -c "uv tool install --quiet ruff >/dev/null && '$UV_TOOL_BIN_DIR/ruff' --version"
+    run "pip in a venv"        - bash -c "cd '$W' && python3 -m venv v >/dev/null && ./v/bin/pip install -q requests >/dev/null && ./v/bin/python -c 'import requests'"
+    rm -rf "$W"
+
+    # A globally installed tool must be runnable but not editable.
+    for exe in ralph; do
+        command -v "$exe" >/dev/null || continue
+        run "$exe still runs"   - "$exe" --version
+        p=$(readlink -f "$(command -v "$exe")")
+        denied "$exe is not writable" sh -c "printf '\n' >> '$p'"
+    done
 fi
 
 # ----------------------------------------------------------------- security
