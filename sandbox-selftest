@@ -212,9 +212,15 @@ raise SystemExit(0 if n==16 else 1)"
              "$HOME/.local/share/opencode/mcp-auth.json" \
              "$HOME/.local/share/opencode/account.json" \
              "$HOME/.local/share/opencode/opencode.db" \
-             "$HOME/.ssh/id_ed25519" "$HOME/.ssh/config"; do
+             "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa" "$HOME/.ssh/config"; do
         if [ ! -e "$f" ]; then
-            printf '  %s[ n/a ]%s  %s (not on host)\n' "$DIM" "$OFF" "$f"
+            # Distinguish "masked away" from "this host has no such file": if the
+            # containing directory is present but empty, the mask did its job.
+            if [ -d "$(dirname "$f")" ] && [ -z "$(ls -A "$(dirname "$f")" 2>/dev/null)" ]; then
+                closed "hidden (dir masked)  $f"
+            else
+                printf '  %s[ n/a ]%s  %s (not on host)\n' "$DIM" "$OFF" "$f"
+            fi
         elif [ ! -r "$f" ]; then
             closed "unreadable    $f"
         elif [ ! -s "$f" ]; then

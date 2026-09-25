@@ -71,6 +71,32 @@ export UV_TOOL_DIR="${SBX}/tools"
 export UV_TOOL_BIN_DIR="${SBX}/tools/bin"
 export PIP_CACHE_DIR="${SBX}/cache/pip"
 
+# --- SSH: agent forwarding only, and only when asked -------------------------
+# Key material is never exposed (see the ~/.ssh tmpfs below). What can be
+# forwarded is the agent socket, which performs the crypto on the host and
+# shows the user the usual confirmation prompt. Opt in with
+# OPENCODE_SANDBOX_SSH=1; without it git-over-SSH simply fails to authenticate.
+ssh_args=()
+if [ "${OPENCODE_SANDBOX_SSH:-0}" = "1" ]; then
+    if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "${SSH_AUTH_SOCK}" ]; then
+        # Reachable at the same path inside, so existing tooling and agent
+        # environment variables keep working unchanged.
+        ssh_args=(--dir "$(dirname "${SSH_AUTH_SOCK}")"
+                  --bind "${SSH_AUTH_SOCK}" "${SSH_AUTH_SOCK}")
+        mkdir -p "${SBX}/ssh"
+        if [ ! -s "${SBX}/ssh/known_hosts" ] && [ -r "${HOME}/.ssh/known_hosts" ]; then
+            # Public host keys only; lets git clone verify hosts without an
+            # interactive prompt, and new hosts are accepted per repo.
+            cp -f -- "${HOME}/.ssh/known_hosts" "${SBX}/ssh/known_hosts"
+        fi
+        [ -s "${SBX}/ssh/known_hosts" ] && ssh_args+=(--bind "${SBX}/ssh/known_hosts" "${SBX}/ssh/known_hosts")
+        export SSH_KNOWN_HOSTS="${SBX}/ssh/known_hosts"
+        export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=${SSH_KNOWN_HOSTS}"
+    else
+        echo "bubblewrap_opencode: OPENCODE_SANDBOX_SSH=1 but SSH_AUTH_SOCK is not a live socket; continuing without SSH" >&2
+    fi
+fi
+
 export XDG_DATA_HOME="${SBX}/data"    # opencode.db, storage, snapshot, log, tool-output
 export XDG_STATE_HOME="${SBX}/state"  # locks, kv, prompt-history, model.json
 # The download cache stays shared: it holds no credentials and re-fetching
@@ -84,14 +110,44 @@ export XDG_STATE_HOME="${SBX}/state"  # locks, kv, prompt-history, model.json
 HOST_DATA="${HOME}/.local/share/opencode"
 HOST_STATE="${HOME}/.local/state/opencode"
 
+# Directories that are replaced by an empty tmpfs inside the sandbox. bwrap
+# cannot create a mountpoint underneath a read-only bind, so each one has to
+# exist before bwrap starts; these are all directories opencode, ssh and
+# systemd create on first use anyway. If one is absent and cannot be created,
+# leave it visible read-only and say so instead of refusing to start.
+#
+# The runtime directory is masked twice over on purpose. $XDG_RUNTIME_DIR is
+# whatever the caller exported, and a stale or wrong value would otherwise mask
+# the wrong directory and leave every host socket reachable through the
+# read-only root - so the canonical location is masked as well.
+hide_dirs=()
+skipped_dirs=()
+hidden_paths=" "
+for d in "${XDG_RUNTIME_DIR}" "/run/user/$(id -u)" /run/dbus /run/systemd \
+         "${HOST_DATA}" "${HOST_STATE}" "${HOME}/.ssh"; do
+    [ -n "$d" ] || continue
+    case "${hidden_paths}" in *" ${d} "*) continue ;; esac
+    if [ -d "$d" ] || mkdir -p "$d" 2>/dev/null; then
+        hide_dirs+=(--tmpfs "$d")
+        hidden_paths+="${d} "
+    else
+        echo "bubblewrap_opencode: $d is absent and cannot be created; it stays visible read-only" >&2
+        skipped_dirs+=("$d")
+    fi
+done
+
 # Hide a path behind a 0-byte read-only file: reads see nothing, writes fail,
 # the host copy is untouched. bwrap consumes each fd it is given, so every mask
 # needs its own descriptor.
 mask_args=()
 add_mask() {
-    local fd
+    local p=$1 fd parent s
+    parent="$(dirname "$p")"
+    for s in ${skipped_dirs[@]+"${skipped_dirs[@]}"}; do
+        [ "$parent" = "$s" ] && return 0
+    done
     exec {fd}</dev/null
-    mask_args+=(--ro-bind-data "$fd" "$1")
+    mask_args+=(--ro-bind-data "$fd" "$p")
 }
 add_mask "${HOST_STATE}/service.json"
 for f in auth.json mcp-auth.json account.json; do
@@ -147,16 +203,12 @@ bwrap_args=(
     #   /run/dbus         system bus => polkit/pkexec, flatpak, NetworkManager
     #   /run/systemd      system manager, journal socket (log forgery)
     # The sandbox keeps its own empty runtime dir to write sockets into.
-    --tmpfs "${XDG_RUNTIME_DIR}"
-    --tmpfs /run/dbus
-    --tmpfs /run/systemd
 
-    # Hide the host's opencode data and state. This takes out the credentials
-    # (auth.json, mcp-auth.json, account.json), the host-wide server's
-    # service.json, and ~900M of session history, logs and tool output in one
-    # go. The sandbox uses the per-repo copy below instead.
-    --tmpfs "${HOST_DATA}"
-    --tmpfs "${HOST_STATE}"
+    # Hide the host's opencode data and state (credentials, the host-wide
+    # server's service.json, ~900M of session history) and all of ~/.ssh, so
+    # --ro-bind / / does not leave key material readable. The sandbox uses the
+    # per-repo copy below instead.
+    "${hide_dirs[@]}"
 
     # Belt and braces: the credential paths are not writable either, so nothing
     # can plant a plausible auth.json even in the empty tmpfs above. A 0-byte
@@ -177,11 +229,10 @@ bwrap_args=(
     # Add some temporary file systems
     --tmpfs /tmp
 
-    # SSH doesn't like the "nobody" ownership of ro files
-    # Hide global ssh config
-    --tmpfs /etc/ssh/
-    # Also, it might need to create files here
-    --bind-try "${HOME}/.ssh" "${HOME}/.ssh"
+    # SSH: no key material, ever. ~/.ssh is one of the tmpfs mounts above, so
+    # private keys, config and known_hosts are gone. Agent forwarding, when
+    # enabled, is bound in *after* the mask, so the socket survives it.
+    "${ssh_args[@]}"
 
     # Toolchains: read-only. These are on the host PATH, so a writable bind here
     # is a code-execution path into every later, possibly unsandboxed, shell.
