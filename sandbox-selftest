@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+#
+# sandbox-selftest — runs INSIDE the bubblewrap sandbox created by
+# bubblewrap_opencode and reports:
+#
+#   [ OK ]      functionality that must keep working
+#   [CLOSED]    an escape channel that is unusable
+#   [ OPEN]    an escape channel that is still usable   <-- the interesting ones
+#
+# Design note: bus daemons and agents answer with all sorts of cheerful error
+# messages ("The folder Passwords does not exist!") that look like failures but
+# mean the socket was reached. So the authoritative test for every host IPC
+# channel is a plain connect(2) to the socket, not the exit code of a client.
+# Client tools are probed too, but only the definitive signals count.
+#
+# Usage:  ./sandbox-selftest              all sections
+#         ./sandbox-selftest security     escape channels only
+#         ./sandbox-selftest functional  usability only
+
+set -uo pipefail
+
+WHICH="${1:-all}"
+RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BOLD=$'\033[1m'; DIM=$'\033[2m'; OFF=$'\033[0m'
+fails=0
+
+ok()     { printf '  %s[ OK ]%s   %s\n' "$GREEN" "$OFF" "$1"; }
+closed() { printf '  %s[CLOSED] %s  %s\n' "$GREEN" "$OFF" "$1"; }
+open_()  { printf '  %s[ OPEN] %s  %s\n' "$RED" "$OFF" "$1"; printf '         %s↳ reachable%s\n' "$DIM" "$OFF"; fails=$((fails+1)); }
+bad()    { printf '  %s[FAIL ] %s  %s\n' "$RED" "$OFF" "$1"; fails=$((fails+1)); }
+note()   { printf '         %s%s%s\n' "$DIM" "$1" "$OFF"; }
+section(){ printf '\n%s%s%s\n' "$BOLD" "$1" "$OFF"; }
+
+# try_connect <path> -> 0 if a client can connect (i.e. the door is open)
+try_connect() {
+    python3 - "$1" <<'PY' 2>/dev/null
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(3)
+try:
+    s.connect(sys.argv[1])
+except Exception:
+    sys.exit(1)
+sys.exit(0)
+PY
+}
+
+# sock <label> <path...>  — closed unless one of the paths accepts a connection
+declare -A seen=()
+sock() {
+    local label=$1; shift
+    local p hit=""
+    for p in "$@"; do
+        [ -S "$p" ] || continue
+        seen["$p"]=1          # register every candidate, not just up to the first hit
+    done
+    for p in "$@"; do
+        [ -S "$p" ] || continue
+        if try_connect "$p"; then hit="$p"; break; fi
+    done
+    if [ -n "$hit" ]; then open_ "$label  →  $hit"; else closed "$label"; fi
+}
+
+# run <label> <success-pattern|-> <cmd...>  — open only if the dangerous thing happened
+run() {
+    local label=$1 pat=$2; shift 2
+    local out rc
+    out=$(timeout 20 "$@" 2>&1); rc=$?
+    if [ "$pat" = "-" ]; then
+        if [ $rc -eq 0 ]; then ok "$label"; else bad "$label  (exit $rc)"; note "$(printf '%s' "$out" | head -1)"; fi
+    elif printf '%s' "$out" | grep -qE "$pat"; then
+        open_ "$label"; note "$(printf '%s' "$out" | grep -m1 -E "$pat")"
+    else
+        closed "$label"; note "$(printf '%s' "$out" | head -1)"
+    fi
+}
+
+# denied <label> <cmd...> — for things that must NOT work. Success is the finding.
+denied() {
+    local label=$1; shift
+    local out rc
+    out=$(timeout 20 "$@" 2>&1); rc=$?
+    if [ $rc -eq 0 ]; then
+        open_ "$label"
+        note "$(printf '%s' "$out" | head -1)"
+    else
+        closed "$label"
+        note "$(printf '%s' "$out" | grep -m1 -iE 'not permitted|denied|read-only|ENOSPC|No space|failed|not found' || printf '%s' "$out" | head -1)"
+    fi
+}
+
+# ---------------------------------------------------------------- functional
+if [ "$WHICH" = all ] || [ "$WHICH" = functional ]; then
+    section "FUNCTIONALITY (must keep working)"
+    run "opencode runs"                 - opencode --version
+    run "node"                          - node --version
+    run "bun"                           - bun --version
+    run "git"                           - git --version
+    run "python3"                       - python3 --version
+    run "ssh"                           - ssh -V
+    run "working dir is writable"       - touch ./.selftest-probe
+    run "git history readable"          - git log --oneline -1
+    run "filesystem is readable"        - ls /usr/bin
+    run "HOME is readable"              - ls "$HOME"
+    run "user lookup works (nsswitch)"  - getent passwd "$(id -un)"
+    run "DNS resolution works"          - getent hosts github.com
+    run "egress to the internet"        - curl -sS -o /dev/null --max-time 10 https://api.anthropic.com/v1/models
+    run "/tmp is writable"              - touch /tmp/.selftest-probe
+    rm -f ./.selftest-probe /tmp/.selftest-probe 2>/dev/null
+
+    printf '\n  %sbounds that are writable from inside%s\n' "$BOLD" "$OFF"
+    for d in "$HOME/.bun" "$HOME/.local/share/uv/tools" "$HOME/.local/state/opencode" \
+             "$HOME/.local/share/opencode" "$HOME/.cache"; do
+        [ -e "$d" ] || continue
+        if touch "$d/.selftest-probe" 2>/dev/null; then
+            rm -f "$d/.selftest-probe"; printf '    %swritable%s   %s\n' "$YELLOW" "$OFF" "$d"
+        else
+            printf '    %sro%s        %s\n' "$GREEN" "$OFF" "$d"
+        fi
+    done
+    [ -n "${SSH_AUTH_SOCK:-}" ] && printf '    SSH_AUTH_SOCK=%s\n' "$SSH_AUTH_SOCK"
+fi
+
+# ----------------------------------------------------------------- security
+if [ "$WHICH" = all ] || [ "$WHICH" = security ]; then
+    section "HOST IPC SOCKETS (a connectable socket = a door)"
+    sock "systemd user manager"     "${XDG_RUNTIME_DIR}/systemd/private" "${XDG_RUNTIME_DIR}/bus"
+    sock "D-Bus system bus"         /run/dbus/system_bus_socket
+    sock "KDE Wallet"               "${XDG_RUNTIME_DIR}/kwallet5.socket"
+    sock "Wayland compositor"       "${XDG_RUNTIME_DIR}/wayland-0"
+    sock "PulseAudio"               "${XDG_RUNTIME_DIR}/pulse/native"
+    sock "PipeWire"                 "${XDG_RUNTIME_DIR}/pipewire-0" "${XDG_RUNTIME_DIR}/pipewire-0-manager"
+    sock "accessibility bus (a11y)" "${XDG_RUNTIME_DIR}/at-spi/bus_0"
+    sock "PKCS#11 / smartcards"     "${XDG_RUNTIME_DIR}/p11-kit/pkcs11"
+    sock "gpg-agent (SSH keys)"     "${XDG_RUNTIME_DIR}/gnupg/S.gpg-agent.ssh" "${XDG_RUNTIME_DIR}/gnupg/S.gpg-agent"
+    sock "systemd journal"          /run/systemd/journal/socket
+    sock "xdg document portal"      "${XDG_RUNTIME_DIR}/doc"
+
+    # Anything I did not think to list still counts.
+    extra=0
+    while read -r p; do
+        [ -n "${seen[$p]:-}" ] && continue
+        seen["$p"]=1
+        if try_connect "$p"; then
+            extra=$((extra+1)); printf '    %sUNLISTED: %s%s\n' "$RED" "$p" "$OFF"
+        fi
+    done < <(find "${XDG_RUNTIME_DIR:-/nonexistent}" /run/dbus /run/systemd -maxdepth 3 -type s 2>/dev/null)
+    [ "$extra" -eq 0 ] && closed "no unlisted socket is connectable"
+    fails=$((fails+extra))
+
+    section "ESCAPE MECHANISMS  (all of these must be denied)"
+    run  "systemd-run --user spawns on the HOST" 'Running as unit' systemd-run --user --wait /bin/true
+    denied "nsenter into a host namespace"     nsenter -t 1 -m -u -i -n -p /bin/true
+    denied "machinectl shell"                  machinectl shell /bin/true
+    denied "nested user namespace"             unshare -Ur true
+    denied "nested bwrap"                      bwrap --ro-bind / / true
+    denied "read host kernel log"              dmesg
+    denied "write to /proc/sys"                sh -c 'echo 1 > /proc/sys/kernel/core_pattern'
+    denied "load a kernel module"              modprobe tun
+    denied "mount anything new"                sh -c 'mount -t tmpfs none /mnt'
+    denied "ptrace another process"           timeout 5 gdb -batch -p 1
+    denied "read another process's memory"   python3 -c "
+import ctypes
+libc=ctypes.CDLL('libc.so.6',use_errno=True)
+buf=ctypes.create_string_buffer(16)
+class IOV(ctypes.Structure):
+    _fields_=[('base',ctypes.c_void_p),('len',ctypes.c_size_t)]
+l=IOV(ctypes.cast(buf,ctypes.c_void_p),16); r=IOV()
+n=libc.process_vm_readv(1,ctypes.byref(l),1,ctypes.byref(r),1,0)
+print('bytes',n,'errno',ctypes.get_errno())
+raise SystemExit(0 if n==16 else 1)"
+
+    section "HOST FILES (must not be readable)"
+    for f in "$HOME/.local/state/opencode/service.json" \
+             "$HOME/.local/share/opencode/auth.json" \
+             "$HOME/.local/share/opencode/mcp-auth.json" \
+             "$HOME/.ssh/id_ed25519" "$HOME/.ssh/config"; do
+        if [ ! -e "$f" ]; then
+            printf '  %s[ n/a ]%s  %s (not on host)\n' "$DIM" "$OFF" "$f"
+        elif [ ! -r "$f" ]; then
+            closed "unreadable  $f"
+        else
+            open_ "readable    $f"
+        fi
+    done
+
+    section "SANDBOX IDENTITY"
+    printf '    uid=%s  pid1=%s  hostname=%s\n' "$(id -u)" "$(cat /proc/1/comm 2>/dev/null)" "$(hostname 2>/dev/null)"
+    printf '    XDG_DATA_HOME=%s\n'  "${XDG_DATA_HOME:-<unset>}"
+    printf '    XDG_STATE_HOME=%s\n' "${XDG_STATE_HOME:-<unset>}"
+    printf '    XDG_CACHE_HOME=%s\n' "${XDG_CACHE_HOME:-<unset>}"
+    printf '    host sockets in %s: %s\n' "${XDG_RUNTIME_DIR:-/nonexistent}" \
+        "$(find "${XDG_RUNTIME_DIR:-/nonexistent}" -maxdepth 2 -type s 2>/dev/null | wc -l)"
+fi
+
+printf '\n'
+if [ "$fails" -eq 0 ]; then
+    printf '%s✓ no open escape channels%s\n' "$GREEN" "$OFF"
+else
+    printf '%s✗ %d open item(s)%s\n' "$RED" "$fails" "$OFF"
+fi
+exit $(( fails > 0 ))

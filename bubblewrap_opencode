@@ -56,6 +56,14 @@ bwrap_args=(
     --bind "${CURRENT_FOLDER}" "${CURRENT_FOLDER}"
 )
 
+# Escape hatch: run an arbitrary command inside exactly the sandbox opencode
+# would get, instead of opencode itself. Used by sandbox-selftest and handy for
+# one-off commands. Unset again so it cannot leak into the sandbox.
+if [ -n "${OPENCODE_SANDBOX_EXEC:-}" ]; then
+    unset OPENCODE_SANDBOX_EXEC
+    exec "${bwrap_args[@]}" -- "$@"
+fi
+
 # For v2+, run with a private server so the host-wide background service
 # is not touched (other opencode sessions stay running) and the sandbox
 # actually contains the server instead of having the client delegate to a
