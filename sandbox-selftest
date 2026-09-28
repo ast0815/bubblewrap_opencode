@@ -80,6 +80,32 @@ run() {
     fi
 }
 
+# bind_root <path> — the source subtree that is really behind <path> in this
+# mount namespace, or empty if <path> is not a mount point of its own.
+#
+# This is the only honest way to classify a writable path. A path comparison
+# cannot tell a per-repo file bind from a bind of one shared file, because both
+# are reached at a path inside the repo's own state directory — and that
+# distinction is exactly what the writable-bounds report is claiming. The mount
+# table records the source subtree of every bind, so it answers the question
+# directly instead of by inference.
+#
+# Field 5 of a /proc/self/mountinfo line is the mount point and field 4 is the
+# root of the source subtree. bwrap mounts file binds as their own mount, so a
+# file bind shows up as a mount whose root is the source path of that file.
+#
+# Caveat, and the reason callers must not compare this against $HOME: the root
+# is relative to the *filesystem*, not to the host's directory tree. On a btrfs
+# subvolume it therefore reads "/@home/lukas/..." where the host path is
+# "/home/lukas/...". Callers classify on the repo key, which survives that, and
+# no caller reconstructs a host path from this value.
+bind_root() {
+    awk -v want="$1" '
+        $5 == want || $5 == want "/" { print $4; found = 1; exit }
+        END { exit(found ? 0 : 1) }
+    ' /proc/self/mountinfo 2>/dev/null
+}
+
 # denied <label> <cmd...> — for things that must NOT work. Success is the finding.
 denied() {
     local label=$1; shift
@@ -133,9 +159,18 @@ if [ "$WHICH" = all ] || [ "$WHICH" = functional ]; then
     rm -f ./.selftest-probe /tmp/.selftest-probe 2>/dev/null
 
     printf '\n  %sbounds that are writable from inside%s\n' "$BOLD" "$OFF"
-    # The wrapper's per-repo state root, recovered from the paths it exported:
-    # XDG_DATA_HOME is $SBX/data, so its grandparent is $SBX.
-    SBX_ROOT="$(dirname "$(dirname "${XDG_DATA_HOME:-/nonexistent/data}")")"
+    # The wrapper's per-repo state root, recovered from the path it exported:
+    # XDG_DATA_HOME is $SBX/data, so its parent is $SBX.
+    #
+    # One dirname, not two. Taking the grandparent yields the *base* that holds
+    # every repo plus prefs/, which makes the classifier below call the shared
+    # preferences file repo-local -- reporting exactly the sharing it is supposed
+    # to reveal. The comment here used to say "grandparent" and was wrong.
+    SBX_ROOT="$(dirname "${XDG_DATA_HOME:-/nonexistent/data}")"
+    # The key is the directory name the wrapper derives from the repo path. It is
+    # what distinguishes "this repo's own bind" from "a file shared with other
+    # repos" in a mount root, robustly across filesystems -- see below.
+    SBX_KEY="$(basename "${SBX_ROOT}")"
     # Writable is only a problem when the write lands on a real host filesystem.
     # A tmpfs is writable but empty and discarded when the sandbox exits.
     #
@@ -146,31 +181,205 @@ if [ "$WHICH" = all ] || [ "$WHICH" = functional ]; then
     # opencode service sharing the same directory. A WRITABLE line against the
     # host path is the finding; a WRITABLE line against $XDG_CACHE_HOME is the
     # expected result.
+    #
+    # The preferences file is listed for the same reason, and it is the case that
+    # a path test alone gets wrong. It *looks* repo-local -- it is opened at
+    # $XDG_STATE_HOME/opencode/model.json, inside this repo's own state dir -- but
+    # it is a bind of a file that lives in the parent of that dir, so writes go
+    # to a file every other repo also uses. A path comparison would call it
+    # repo-local and miss exactly the thing worth reporting, so every writable
+    # path is classified by asking the kernel which host file is really behind
+    # it (see bind_root) instead.
     for d in "$HOME/.bun" "$HOME/.local/share/uv/tools" "$HOME/.local/state/opencode" \
              "$HOME/.local/share/opencode" "$HOME/.cache" "$HOME/.cache/opencode" \
-             "$XDG_CACHE_HOME" "$XDG_CACHE_HOME/opencode" "$HOME/.ssh"; do
+             "$HOME/.config/opencode" "$HOME/.config/opencode/cli.json" \
+             "$XDG_CACHE_HOME" "$XDG_CACHE_HOME/opencode" "$HOME/.ssh" \
+             "${XDG_CONFIG_HOME:-$HOME/.config}" "${OPENCODE_CONFIG_DIR:-/nonexistent}" \
+             "${XDG_STATE_HOME:-/nonexistent}/opencode/model.json"; do
         [ -e "$d" ] || continue
-        if ! touch "$d/.selftest-probe" 2>/dev/null; then
+        # model.json and cli.json are files, so there is no ".selftest-probe" to
+        # create inside them. test -w answers the same question for a file and has
+        # the advantage of not modifying the file it inspects.
+        if [ -f "$d" ]; then
+            [ -w "$d" ] || { printf '    %sro        %s  %s\n' "$GREEN" "$OFF" "$d"; continue; }
+        elif ! touch "$d/.selftest-probe" 2>/dev/null; then
             printf '    %sro        %s  %s\n' "$GREEN" "$OFF" "$d"
             continue
+        else
+            rm -f "$d/.selftest-probe" 2>/dev/null
         fi
-        rm -f "$d/.selftest-probe" 2>/dev/null
         case "$(stat -f -c %T "$d" 2>/dev/null)" in
             tmpfs) printf '    %stmpfs      %s  (writable, but empty and ephemeral)%s\n' "$YELLOW" "$d" "$OFF" ;;
             *)
-                # A write that lands in this repo's own state directory is the
-                # design, not a finding. A write that lands anywhere else on the
-                # host is. Only the second one is red.
-                case "$d" in
-                    "${SBX_ROOT}"/*)
-                        printf '    %srepo-local %s  (this repo'"'"'s own state dir)%s\n' "$YELLOW" "$d" "$OFF" ;;
-                    *)
-                        printf '    %sWRITABLE   %s  <-- writes reach the host outside this repo%s\n' "$RED" "$d" "$OFF" ;;
-                esac
+                # The host file behind this mount point, or empty when the path is
+                # an ordinary file on an ordinary writable bind. That is the
+                # authoritative answer, and it needs no guessing about paths.
+                #
+                # The comparison is on the *repo key* (basename of $SBX_ROOT), not
+                # on a full path prefix. bwrap records a bind's source relative to
+                # the filesystem it came from, so on a btrfs subvolume the root
+                # reads "/@home/lukas/..." where the host path is
+                # "/home/lukas/..." -- a prefix comparison against $SBX_ROOT
+                # silently fails there and would report this repo's own
+                # directories as "shared". The key appears in the repo's roots and
+                # not in the preferences root, so it separates the two correctly
+                # on any filesystem.
+                root="$(bind_root "$d")"
+                if [ -z "$root" ] || [ "${root#*"$SBX_KEY"}" != "$root" ]; then
+                    # Either genuinely this repo's own storage, or a plain file in
+                    # it. Both are the design.
+                    printf '    %srepo-local %s  (this repo'"'"'s own state dir)%s\n' "$YELLOW" "$d" "$OFF"
+                else
+                    # A bind whose source lives outside this repo's directory.
+                    # Named, not coloured red: this is the preferences file doing
+                    # what it is for, and naming the source is the point.
+                    printf '    %sshared     %s  (bind of %s)%s\n' "$YELLOW" "$d" "$root" "$OFF"
+                fi
                 ;;
         esac
     done
     [ -n "${SSH_AUTH_SOCK:-}" ] && printf '    SSH_AUTH_SOCK=%s\n' "$SSH_AUTH_SOCK"
+
+    # --- per-repo opencode config --------------------------------------------
+    # The config copy is the whole point of OPENCODE_CONFIG_DIR: without it
+    # cli.json is read-only and the settings dialog fails with EROFS, and a
+    # plugin in the config cannot install its dependencies. Both are asserted
+    # here, and so is the property that makes the copy worth having -- the host's
+    # original must still be unwritable, or there would be no reason for it.
+    section "OPENCODE CONFIG (per repo, seeded from the host)"
+    if [ -z "${OPENCODE_CONFIG_DIR:-}" ]; then
+        bad "OPENCODE_CONFIG_DIR is not set"
+    else
+        ok "OPENCODE_CONFIG_DIR=${OPENCODE_CONFIG_DIR}"
+        run "config dir is writable" - touch "${OPENCODE_CONFIG_DIR}/.selftest-probe"
+        rm -f "${OPENCODE_CONFIG_DIR}/.selftest-probe" 2>/dev/null
+        # The bind has to be this repo's copy, not the host's directory wearing
+        # the same variable. Inodes differ because it is a copy, so compare the
+        # resolved paths and the mount table instead of guessing from the name.
+        if [ -e "${OPENCODE_CONFIG_DIR}/cli.json" ]; then
+            host_cfg="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/cli.json"
+            if [ "$(stat -c %d:%i "${OPENCODE_CONFIG_DIR}/cli.json" 2>/dev/null)" = \
+                 "$(stat -c %d:%i "$host_cfg" 2>/dev/null)" ]; then
+                bad "config/cli.json is the host's own file, not the per-repo copy"
+                note "a writable host config is a config change an agent can plant for every later session"
+            else
+                ok "cli.json is this repo's own copy, not the host's file"
+            fi
+        else
+            note "no cli.json in the copy (the host has none, or the seed failed)"
+        fi
+        # A dangling symlink in the copy is the failure mode that costs the user
+        # an afternoon: opencode starts, has no providers and no MCP servers, and
+        # says nothing about why. This is the check that catches it.
+        dangling="$(find "${OPENCODE_CONFIG_DIR}" -xtype l -print 2>/dev/null | head -5)"
+        if [ -n "$dangling" ]; then
+            bad "dangling symlinks in the config copy"
+            printf '%s\n' "$dangling" | while IFS= read -r l; do note "↳ $l"; done
+        else
+            ok "no dangling symlinks in the config copy"
+        fi
+        # The host's copy must be read-only; that is the invariant the per-repo
+        # arrangement exists to preserve. Checked in the security section.
+    fi
+
+    # --- shared preferences ---------------------------------------------------
+    section "PREFERENCES (one file, shared by every repo)"
+    prefs="${XDG_STATE_HOME:-/nonexistent}/opencode/model.json"
+    if [ ! -e "$prefs" ]; then
+        bad "no model.json at ${prefs}"
+    else
+        ok "model.json present at ${prefs}"
+        # Shared means the file behind this path lives *outside* this repo's own
+        # directory. It cannot be judged from the path, because the path is the
+        # per-repo one by construction: opencode opens
+        # $XDG_STATE_HOME/opencode/model.json. bind_root reports the source the
+        # kernel actually has mounted there, which is the only thing that tells
+        # "this repo's own file" apart from "the one file every repo uses".
+        #
+        # Every test below matches on a *suffix*, never on a full path. The mount
+        # root is relative to the filesystem and carries a btrfs subvolume prefix
+        # here ("/@home/lukas/..."), so a path comparison would classify this as
+        # an unexpected source. Real host paths are derived from $SBX_ROOT and
+        # $HOME instead, where the directory tree is the real one.
+        root="$(bind_root "$prefs")"
+        host_prefs="$HOME/.local/state/opencode/model.json"
+        # The shared file's real location: a sibling of this repo's own state
+        # directory. Derived from $SBX_ROOT because the directory tree here is the
+        # real one, unlike the mount root, which is filesystem-relative.
+        pdir="$(dirname "${SBX_ROOT}")/prefs"
+        case "$root" in
+            "")
+                # No bind at all: the file is an ordinary one in this repo's own
+                # state directory, which is what opencode used before preferences
+                # were shared.
+                bad "model.json is this repo's own file, not a shared one"
+                note "favourites will not follow you between repositories"
+                ;;
+            */prefs/model.json)
+                ok "shared with every other repo  (${pdir}/model.json)"
+                # Only the file is shared. The wrapper masks the whole state root
+                # and binds the one file back, so the directory that holds it is
+                # not visible from inside at all -- which is stronger than
+                # read-only, and is checked as such. "Visible but not writable"
+                # would be reported separately, because it means something
+                # different went wrong.
+                if [ ! -e "$pdir" ]; then
+                    ok "the shared preferences directory is not visible from inside"
+                    note "$pdir"
+                elif [ -w "$pdir" ]; then
+                    bad "the shared preferences directory is writable"
+                    note "$pdir"
+                else
+                    ok "the shared preferences directory is visible but not writable"
+                    note "$pdir"
+                    # And it must hold nothing but that one file, so a future
+                    # change that starts storing more there is visible.
+                    extra="$(ls -A "$pdir" 2>/dev/null | grep -v '^model.json$' | head -5)"
+                    if [ -n "$extra" ]; then
+                        bad "unexpected entries in the shared preferences directory"
+                        printf '%s\n' "$extra" | while IFS= read -r e; do note "↳ $e"; done
+                    else
+                        ok "the shared preferences directory holds only model.json"
+                    fi
+                fi
+                ;;
+            *"/state/opencode/model.json")
+                if [ "${root#*"$SBX_KEY"}" != "$root" ]; then
+                    # Bound to itself, i.e. this repo's own file. The presence of a
+                    # bind at all means the wrapper is doing something explicit
+                    # that it should not be doing.
+                    bad "model.json is bound to this repo's own copy"
+                else
+                    # The host's own file, which is what OPENCODE_SANDBOX_HOST_PREFS=1
+                    # asks for. Reported plainly rather than as a finding: it is the
+                    # one bind in the wrapper that lets a sandboxed process edit
+                    # host state, and it is opt-in.
+                    ok "bound to the host's own model.json (OPENCODE_SANDBOX_HOST_PREFS=1)"
+                    note "$host_prefs"
+                    note "a sandboxed agent can edit the host's favourites, recents and variants"
+                fi
+                ;;
+            *)
+                bad "model.json is bound from an unexpected source"
+                note "$root"
+                ;;
+        esac
+        # Recents and favourites must be readable as JSON, not just present: a
+        # truncated or half-written file is the failure mode of an interrupted
+        # copy, and opencode reads this file with a lenient parser that turns
+        # anything unrecognised into an empty list -- so a corrupt file shows up
+        # as "my favourites vanished" rather than as an error.
+        if python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+assert isinstance(d.get('recent',[]),list) and isinstance(d.get('favorite',[]),list) and isinstance(d.get('variant',{}),dict)
+" "$prefs" 2>/dev/null; then
+            ok "model.json parses and has the expected shape"
+        else
+            bad "model.json is not valid JSON with the expected shape"
+            note "an interrupted write leaves a file opencode silently reads as empty"
+        fi
+    fi
 fi
 
 # ---------------------------------------------------------------- toolchains
@@ -222,17 +431,17 @@ fi
 # ----------------------------------------------------------------- security
 if [ "$WHICH" = all ] || [ "$WHICH" = security ]; then
     section "HOST IPC SOCKETS (a connectable socket = a door)"
-    sock "systemd user manager"     "${XDG_RUNTIME_DIR}/systemd/private" "${XDG_RUNTIME_DIR}/bus"
+    sock "systemd user manager"     "${XDG_RUNTIME_DIR:-/nonexistent}/systemd/private" "${XDG_RUNTIME_DIR:-/nonexistent}/bus"
     sock "D-Bus system bus"         /run/dbus/system_bus_socket
-    sock "KDE Wallet"               "${XDG_RUNTIME_DIR}/kwallet5.socket"
-    sock "Wayland compositor"       "${XDG_RUNTIME_DIR}/wayland-0"
-    sock "PulseAudio"               "${XDG_RUNTIME_DIR}/pulse/native"
-    sock "PipeWire"                 "${XDG_RUNTIME_DIR}/pipewire-0" "${XDG_RUNTIME_DIR}/pipewire-0-manager"
-    sock "accessibility bus (a11y)" "${XDG_RUNTIME_DIR}/at-spi/bus_0"
-    sock "PKCS#11 / smartcards"     "${XDG_RUNTIME_DIR}/p11-kit/pkcs11"
-    sock "gpg-agent (SSH keys)"     "${XDG_RUNTIME_DIR}/gnupg/S.gpg-agent.ssh" "${XDG_RUNTIME_DIR}/gnupg/S.gpg-agent"
+    sock "KDE Wallet"               "${XDG_RUNTIME_DIR:-/nonexistent}/kwallet5.socket"
+    sock "Wayland compositor"       "${XDG_RUNTIME_DIR:-/nonexistent}/wayland-0"
+    sock "PulseAudio"               "${XDG_RUNTIME_DIR:-/nonexistent}/pulse/native"
+    sock "PipeWire"                 "${XDG_RUNTIME_DIR:-/nonexistent}/pipewire-0" "${XDG_RUNTIME_DIR:-/nonexistent}/pipewire-0-manager"
+    sock "accessibility bus (a11y)" "${XDG_RUNTIME_DIR:-/nonexistent}/at-spi/bus_0"
+    sock "PKCS#11 / smartcards"     "${XDG_RUNTIME_DIR:-/nonexistent}/p11-kit/pkcs11"
+    sock "gpg-agent (SSH keys)"     "${XDG_RUNTIME_DIR:-/nonexistent}/gnupg/S.gpg-agent.ssh" "${XDG_RUNTIME_DIR:-/nonexistent}/gnupg/S.gpg-agent"
     sock "systemd journal"          /run/systemd/journal/socket
-    sock "xdg document portal"      "${XDG_RUNTIME_DIR}/doc"
+    sock "xdg document portal"      "${XDG_RUNTIME_DIR:-/nonexistent}/doc"
 
     # Anything I did not think to list still counts.
     extra=0
@@ -308,11 +517,90 @@ raise SystemExit(0 if n==16 else 1)"
         fi
     done
 
+    # The host's own model.json must stay hidden at its own path even when the
+    # preferences are shared or bound through. The bind only ever *replaces* the
+    # file at the per-repo path, so the masked host state directory is still an
+    # empty tmpfs here. Note that this holds under
+    # OPENCODE_SANDBOX_HOST_PREFS=1 as well: that flag makes the host's file
+    # writable, but it does not make it visible at its host path.
+    if [ -e "$HOME/.local/state/opencode/model.json" ]; then
+        open_ "READABLE     $HOME/.local/state/opencode/model.json  ($(stat -c %s "$HOME/.local/state/opencode/model.json") bytes)"
+    else
+        closed "hidden (dir masked)  $HOME/.local/state/opencode/model.json"
+    fi
+    # The host's config directory is deliberately *not* masked -- it is the user's
+    # own configuration, and a dotfiles symlink inside it has to keep resolving.
+    # It must still be read-only, and its contents are the user's choice rather
+    # than a leak, so this asserts writability and not content.
+    if [ -e "$HOME/.config/opencode/cli.json" ]; then
+        denied "not writable: ~/.config/opencode/cli.json" test -w "$HOME/.config/opencode/cli.json"
+    else
+        printf '  %s[ n/a ]%s  ~/.config/opencode/cli.json (not on host)\n' "$DIM" "$OFF"
+    fi
+
+    # Cross-repo isolation, stated as a measurement rather than an assumption.
+    # The state root holds one directory per repo, and each of those contains a
+    # live credential copy at data/opencode/auth.json. Until the state root was
+    # masked, --ro-bind / / left it readable, so a sandbox in one repo could
+    # read another repo's credentials. That was measured, not suspected, and it
+    # is the reason the whole root is now a tmpfs with only this repo's
+    # directories bound back in. This is the check that would catch a regression,
+    # so it asserts visibility and writability, not just one of the two.
+    section "CROSS-REPO ISOLATION (another repo's state is not reachable)"
+    # The per-repo state root is normally recovered in the functional section, so
+    # it is derived again here: the security section must also work on its own,
+    # and `set -u` would abort on an unset variable rather than skip the check.
+    sbx_root="$(dirname "${XDG_DATA_HOME:-/nonexistent/data}")"
+    root="$(dirname "${sbx_root}")"
+    # First the positive half, so the negative checks below cannot pass merely
+    # because nothing was mounted at all.
+    if [ -w "${sbx_root}/data" ] && [ -w "${sbx_root}/state" ]; then
+        closed "this repo's own state is present and writable"
+        note "${sbx_root}"
+    else
+        open_ "this repo's own state is missing or read-only"
+        note "${sbx_root} -- if the mask went too far, sessions and prefs are gone"
+    fi
+    # Then every *other* directory in the state root. A sibling's directory is
+    # a finding whether it is readable or not: the credential inside it is what
+    # matters, not what can be written to it. `prefs` is excluded because it is
+    # shared by design and is checked on its own terms just below -- counting it
+    # as a repo would report a deliberate design as a leak. The wrapper's `meta`
+    # marker is not used to identify a sibling, because the point of the mask is
+    # that this repo's own directory no longer carries a readable `meta` either.
+    others=""
+    for sib in "$root"/*/; do
+        [ -d "$sib" ] || continue
+        [ "${sib%/}" = "${sbx_root}" ] && continue
+        [ "$(basename "${sib%/}")" = prefs ] && continue
+        others="${others:+${others}, }$(basename "${sib%/}")"
+    done
+    if [ -n "$others" ]; then
+        open_ "another repo's state directory is visible: ${others}"
+        note "its data/opencode/auth.json is a credential copy of that repo's account"
+    else
+        closed "no other repo's state directory is visible in the state root"
+        note "${root}"
+    fi
+    # The shared preferences directory goes with the rest of the root: only its
+    # one file is bound in, at this repo's own state path. Checking it separately
+    # keeps the deliberate sharing from being mistaken for the leak above.
+    if [ -e "${root}/prefs" ]; then
+        if [ -w "${root}/prefs" ]; then
+            open_ "the shared preferences directory is writable: ${root}/prefs"
+        else
+            closed "the shared preferences directory is visible but not writable"
+        fi
+    else
+        closed "the shared preferences directory is masked; only its file is bound in"
+    fi
+
     section "SANDBOX IDENTITY"
     printf '    uid=%s  pid1=%s  hostname=%s\n' "$(id -u)" "$(cat /proc/1/comm 2>/dev/null)" "$(hostname 2>/dev/null)"
     printf '    XDG_DATA_HOME=%s\n'  "${XDG_DATA_HOME:-<unset>}"
     printf '    XDG_STATE_HOME=%s\n' "${XDG_STATE_HOME:-<unset>}"
     printf '    XDG_CACHE_HOME=%s\n' "${XDG_CACHE_HOME:-<unset>}"
+    printf '    OPENCODE_CONFIG_DIR=%s\n' "${OPENCODE_CONFIG_DIR:-<unset>}"
     printf '    host sockets in %s: %s\n' "${XDG_RUNTIME_DIR:-/nonexistent}" \
         "$(find "${XDG_RUNTIME_DIR:-/nonexistent}" -maxdepth 2 -type s 2>/dev/null | wc -l)"
 fi

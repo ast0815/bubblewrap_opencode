@@ -24,6 +24,14 @@ REAL_COMMAND="$(readlink -f "$TARGET_EXECUTABLE")"
 : "${XDG_CACHE_HOME:=${HOME}/.cache}"
 export XDG_CACHE_HOME
 XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR%/}"
+# Exported as well, and this one was not, which is a real bug: the default above
+# applies only inside the wrapper, so a process that started without
+# XDG_RUNTIME_DIR (a bare `su`, a service unit, a cron job) would launch the
+# sandbox with no XDG_RUNTIME_DIR at all. The wrapper masks and then recreates
+# that directory, and opencode and the selftest are both told to use it, so the
+# variable has to reach them -- and with `set -u` in the selftest, a missing one
+# aborts the run instead of reporting a verdict.
+export XDG_RUNTIME_DIR
 
 # --- Persistent state, one directory per repo -------------------------------
 # Sessions must survive between runs of this wrapper, but must not live inside
@@ -65,11 +73,16 @@ if [ -z "${SBX}" ]; then
     exit 1
 fi
 
+# This is the "forget what the sandbox learned" button: it drops this repo's
+# data, state, cache *and* config, so the next start re-seeds the config copy
+# from the host. The shared preferences are deliberately not touched - which
+# models you like is neither repo state nor a credential, and revoking a
+# compromised sandbox should not throw it away.
 if [ "${OPENCODE_SANDBOX_RESET:-0}" = "1" ]; then
     echo "bubblewrap_opencode: resetting sandbox state in ${SBX}" >&2
-    rm -rf -- "${SBX}/data" "${SBX}/state" "${SBX}/cache"
+    rm -rf -- "${SBX}/data" "${SBX}/state" "${SBX}/cache" "${SBX}/config"
 fi
-mkdir -p "${SBX}/data/opencode" "${SBX}/state" \
+mkdir -p "${SBX}/data/opencode" "${SBX}/state" "${SBX}/config" \
          "${SBX}/cache/bun" "${SBX}/cache/npm" "${SBX}/cache/uv" \
          "${SBX}/cache/pip" "${SBX}/tools/bin"
 printf '%s\n' "${SBX_ROOT}" > "${SBX}/meta"
@@ -99,9 +112,17 @@ if [ "${OPENCODE_SANDBOX_SSH:-0}" = "1" ]; then
     if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "${SSH_AUTH_SOCK}" ]; then
         # Reachable at the same path inside, so existing tooling and agent
         # environment variables keep working unchanged.
-        ssh_args=(--dir "$(dirname "${SSH_AUTH_SOCK}")"
-                  --bind "${SSH_AUTH_SOCK}" "${SSH_AUTH_SOCK}")
+        #
+        # The state root is a tmpfs inside the sandbox (see the mask list), so
+        # this per-repo directory is not there by the time the bind below runs and
+        # bwrap cannot create a file's parent for it. --dir puts it back. The
+        # file itself is still the persistent host copy - that is what the bind
+        # is for - so hosts accepted by StrictHostKeyChecking=accept-new are
+        # remembered across runs, as they were before the mask.
         mkdir -p "${SBX}/ssh"
+        ssh_args=(--dir "$(dirname "${SSH_AUTH_SOCK}")"
+                  --dir "${SBX}/ssh"
+                  --bind "${SSH_AUTH_SOCK}" "${SSH_AUTH_SOCK}")
         if [ ! -s "${SBX}/ssh/known_hosts" ] && [ -r "${HOME}/.ssh/known_hosts" ]; then
             # Public host keys only; lets git clone verify hosts without an
             # interactive prompt, and new hosts are accepted per repo.
@@ -116,7 +137,10 @@ if [ "${OPENCODE_SANDBOX_SSH:-0}" = "1" ]; then
 fi
 
 export XDG_DATA_HOME="${SBX}/data"    # opencode.db, storage, snapshot, log, tool-output
-export XDG_STATE_HOME="${SBX}/state"  # locks, kv, prompt-history, model.json
+# model.json (favourites, recent models, variants) is deliberately *not* per
+# repo: it is bound in from one shared file further down, so a favourite added
+# in one repo is there in the next.
+export XDG_STATE_HOME="${SBX}/state"  # locks, kv, prompt-history, session.json, latest/tui
 
 # --- XDG_CACHE_HOME: per repo, seeded once from the host cache ----------------
 # The host's ~/.cache/opencode must not be writable. opencode downloads provider
@@ -138,31 +162,94 @@ CACHE_SEED="${XDG_CACHE_HOME}/opencode"
 export XDG_CACHE_HOME="${SBX}/cache/home"
 mkdir -p "${XDG_CACHE_HOME}"
 
-if [ -d "${CACHE_SEED}" ] && [ ! -e "${XDG_CACHE_HOME}/.opencode-seeded" ]; then
+# Copy a host directory to a per-repo path, once and atomically. The cache and
+# opencode's config dir need the same thing, so the logic exists once: the host
+# original stays read-only, the copy is either complete or absent, and failing to
+# copy is never fatal - the wrapper warns and carries on, so a bad source
+# degrades to "opencode starts without it" instead of "the wrapper refuses to
+# start".
+#
+#   $1  source directory on the host; absent means there is nothing to do
+#   $2  the destination path itself, not its parent directory
+#
+# A ".<name>-seeded" marker next to the destination is written last, after the
+# move, because it is the only thing that says "seeded": a half-populated
+# directory that the marker vouched for would survive every later run.
+seed_copy() {
+    local src=$1 dst=$2 dir name reflink probe broken
+    dir="$(dirname "$dst")"
+    name="$(basename "$dst")"
+    if [ ! -d "$src" ] || [ -e "${dir}/.${name}-seeded" ]; then
+        return 0
+    fi
     # Probe reflink support on the destination filesystem without touching the
     # source: a copy within one directory clones if the filesystem can.
-    probe="${XDG_CACHE_HOME}/.reflink-probe"
+    probe="${dir}/.reflink-probe"
     if dd if=/dev/urandom of="${probe}" bs=64K count=1 2>/dev/null &&
        cp --reflink=always -- "${probe}" "${probe}.clone" 2>/dev/null; then
-        seed_reflink=(--reflink=always)
+        reflink=(--reflink=always)
     else
-        seed_reflink=()
-        echo "bubblewrap_opencode: no reflink support on ${XDG_CACHE_HOME}; seeding the opencode cache is a full copy" >&2
+        reflink=()
+        echo "bubblewrap_opencode: no reflink support on ${dir}; seeding ${name} is a full copy" >&2
     fi
     rm -f -- "${probe}" "${probe}.clone"
 
     # Seed to a temporary name and move it into place, so an interrupted seed
-    # cannot leave a half-populated cache that the marker then vouches for.
-    rm -rf -- "${XDG_CACHE_HOME}/opencode.partial"
-    if cp -a "${seed_reflink[@]+"${seed_reflink[@]}"}" -- "${CACHE_SEED}" "${XDG_CACHE_HOME}/opencode.partial" 2>/dev/null &&
-       mv -T -- "${XDG_CACHE_HOME}/opencode.partial" "${XDG_CACHE_HOME}/opencode" 2>/dev/null; then
-        # Marker written last: it is the only thing that says "seeded".
-        : > "${XDG_CACHE_HOME}/.opencode-seeded"
+    # cannot leave a half-populated directory that the marker then vouches for.
+    rm -rf -- "${dst}.partial"
+    if cp -a "${reflink[@]+"${reflink[@]}"}" -- "${src}" "${dst}.partial" 2>/dev/null &&
+       mv -T -- "${dst}.partial" "${dst}" 2>/dev/null; then
+        : > "${dir}/.${name}-seeded"
     else
-        rm -rf -- "${XDG_CACHE_HOME}/opencode.partial"
-        echo "bubblewrap_opencode: could not seed the opencode cache from ${CACHE_SEED}; it will be re-downloaded" >&2
+        rm -rf -- "${dst}.partial"
+        echo "bubblewrap_opencode: could not seed ${name} from ${src}; continuing without it" >&2
+        return 0
     fi
-fi
+
+    # A symlink that does not resolve is a silent failure. The copy looks
+    # complete, but the file it points at is missing, and opencode falls back to
+    # defaults - for a config that means no providers, no MCP servers and no
+    # keybinds, with nothing in the log to say why. Name the offenders instead.
+    broken="$(find "${dst}" -xtype l -print 2>/dev/null | head -5 || true)"
+    if [ -n "$broken" ]; then
+        echo "bubblewrap_opencode: symlinks in ${dst} do not resolve:" >&2
+        printf '  %s\n' "$broken" >&2
+    fi
+    return 0
+}
+
+seed_copy "${CACHE_SEED}" "${XDG_CACHE_HOME}/opencode"
+
+# --- opencode's config dir: per repo, seeded once from the host ---------------
+# The host's ~/.config/opencode must stay read-only, and that breaks two things.
+# cli.json - theme, keybinds, scroll, diffs - cannot be written at all, so the
+# settings dialog fails with EROFS, and a plugin named in the config cannot
+# install its dependencies, because opencode package-manages inside this very
+# directory. Both are fixed by giving each repo its own copy, for the same
+# reason the cache has one: the host original must not be writable from inside.
+#
+# OPENCODE_CONFIG_DIR, not XDG_CONFIG_HOME. opencode relocates its config
+# directory through that variable on both sides - the TUI client resolves the
+# Global service from it, which is where cli.json is read and written, and the
+# server takes it explicitly as config.directory - while project-level
+# opencode.json in the working directory stays a separate, unaffected layer.
+# Moving XDG_CONFIG_HOME instead would relocate every *other* tool's config too:
+# git reads $XDG_CONFIG_HOME/git/config, gh reads its own subdirectory, and both
+# would silently stop seeing their global settings inside the sandbox.
+#
+# Plain files in the copy are a snapshot from seed time, so a config change on
+# the host reaches an existing repo only via OPENCODE_SANDBOX_RESET=1.
+# Symlinks are the exception and stay live: an opencode.json symlinked at a
+# dotfiles repository keeps resolving to the same host file, which is read-only
+# here, so editing it is picked up by every repo immediately.
+#
+# Cost: this copies the whole directory, which is ~57M of plugin-SDK
+# node_modules on this host. Reflink makes that close to free on btrfs and XFS
+# and about a second; without reflink it is a real copy per repo, which
+# seed_copy says out loud.
+HOST_CONFIG="${XDG_CONFIG_HOME:-${HOME}/.config}/opencode"
+export OPENCODE_CONFIG_DIR="${SBX}/config/opencode"
+seed_copy "${HOST_CONFIG}" "${OPENCODE_CONFIG_DIR}"
 
 # --- Credentials -------------------------------------------------------------
 # service.json is the *host-wide* opencode server's password. With --share-net
@@ -182,11 +269,30 @@ HOST_STATE="${HOME}/.local/state/opencode"
 # whatever the caller exported, and a stale or wrong value would otherwise mask
 # the wrong directory and leave every host socket reachable through the
 # read-only root - so the canonical location is masked as well.
+#
+# ${SBX_PARENT}, the state root that holds every repo's directory, is masked for
+# a measured reason. It is not a subdirectory of anything else masked here, so
+# --ro-bind / / used to leave it fully readable: a sandbox in one repo could read
+# a *different* repo's data/opencode/auth.json, which is a live provider
+# credential. That is the compartmentalisation this file exists to provide,
+# failing on the one thing that matters most, so the whole root goes and the
+# per-repo binds later in the argument list put this repo's own directories back.
+#
+# That ordering is safe, and is the same one the SSH socket bind already relies
+# on: bwrap resolves a bind's *source* against the host's filesystem (its
+# get_oldroot_path), not against the partially-mounted namespace, so a source
+# under a tmpfs that was mounted moments earlier still resolves to the real
+# host file. Verified rather than assumed - see the SSH comment at the bind.
+#
+# The base is masked wholesale rather than directory by directory, so a
+# pathological OPENCODE_SANDBOX_HOME pointing too high (~/.local/share, say)
+# costs visibility rather than breaking the sandbox. Hiding too much is the
+# right direction for that mistake.
 hide_dirs=()
 skipped_dirs=()
 hidden_paths=" "
 for d in "${XDG_RUNTIME_DIR}" "/run/user/$(id -u)" /run/dbus /run/systemd \
-         "${HOST_DATA}" "${HOST_STATE}" "${HOME}/.ssh"; do
+         "${HOST_DATA}" "${HOST_STATE}" "${HOME}/.ssh" "${SBX_PARENT}"; do
     [ -n "$d" ] || continue
     case "${hidden_paths}" in *" ${d} "*) continue ;; esac
     if [ -d "$d" ] || mkdir -p "$d" 2>/dev/null; then
@@ -222,6 +328,136 @@ for f in auth.json mcp-auth.json account.json; do
         chmod 600 -- "${SBX}/data/opencode/${f}"
     fi
 done
+
+# --- Favourites and recent models: one file, shared by every repo -------------
+# opencode keeps the model picker state in $XDG_STATE_HOME/opencode/model.json
+# as {recent, favorite, variant}, and XDG_STATE_HOME is per repo, so without
+# this every repo opens with an empty list: a model favourited in one is
+# invisible in the next, and the setting appears not to stick. These describe the
+# person using the machine, not the repository and not the agent's behaviour, so
+# they are the one thing that is deliberately not compartmentalised.
+#
+# The *file* is shared; its directory is not bound read-write. Binding
+# ${SBX_PARENT}/prefs as a writable directory would additionally let any repo
+# drop a file in there for every other repo's opencode to pick up, which buys
+# nothing over sharing one file. The directory is in fact not visible at all
+# inside the sandbox, because the state root that holds it is masked; the bind
+# below is what puts this one file back, at this repo's own state path.
+#
+# Seeded once, one way. The host's model.json first, so a first run anywhere
+# starts from the favourites the unsandboxed opencode already has; failing that,
+# this repo's existing file is promoted, so preferences built up under an older
+# version of this wrapper survive the upgrade. The host file is only ever read.
+#
+# Known wart, documented rather than fixed: opencode locks such a store as
+# dirname(file)/locks/<hash of the full path>, and inside a sandbox that path is
+# this repo's. So two repos writing the shared file at the same time do not
+# exclude each other, and a concurrent toggle can be lost. The file is a few
+# hundred bytes and is rewritten whole, so the outcome is one dropped favourite,
+# never a corrupt file.
+PREFS_DIR="${SBX_PARENT}/prefs"
+PREF_MODEL="${PREFS_DIR}/model.json"
+# One directory for the whole user, a sibling of the per-repo roots rather than
+# inside one of them. Failing to create it is not fatal: preferences then behave
+# as they did before any of this existed, so the bind below is left out and each
+# repo keeps its own file.
+mkdir -p "${PREFS_DIR}" 2>/dev/null || \
+    echo "bubblewrap_opencode: cannot create ${PREFS_DIR}; preferences stay per repo" >&2
+
+# OPENCODE_SANDBOX_SYNC_PREFS=1 re-reads the host's preferences, for after a
+# session with the *unsandboxed* opencode. It runs here, outside the sandbox,
+# and only reads the host file - which is what makes it safe to offer without
+# also offering write-through. It is one way: a favourite added in a sandbox
+# still does not travel back to the host. Writes are atomic so an interrupted
+# pull cannot leave the shared file truncated.
+if [ "${OPENCODE_SANDBOX_SYNC_PREFS:-0}" = "1" ]; then
+    if [ -s "${HOST_STATE}/model.json" ]; then
+        if cp -f -- "${HOST_STATE}/model.json" "${PREF_MODEL}.new" 2>/dev/null &&
+           mv -f -- "${PREF_MODEL}.new" "${PREF_MODEL}" 2>/dev/null; then
+            echo "bubblewrap_opencode: preferences re-read from ${HOST_STATE}/model.json" >&2
+        else
+            rm -f -- "${PREF_MODEL}.new" 2>/dev/null
+            echo "bubblewrap_opencode: could not update ${PREF_MODEL}; keeping what is there" >&2
+        fi
+    else
+        echo "bubblewrap_opencode: OPENCODE_SANDBOX_SYNC_PREFS=1 but ${HOST_STATE}/model.json is absent or empty; nothing to pull" >&2
+    fi
+fi
+
+# Seed the shared file. Only when it does not exist at all, so a repo that has
+# already been running never has its favourites overwritten by a later run.
+if [ ! -e "${PREF_MODEL}" ]; then
+    if [ -s "${HOST_STATE}/model.json" ]; then
+        pref_seed="${HOST_STATE}/model.json"
+    elif [ -s "${SBX}/state/opencode/model.json" ]; then
+        pref_seed="${SBX}/state/opencode/model.json"
+    else
+        pref_seed=""
+    fi
+    if [ -n "$pref_seed" ]; then
+        cp -f -- "$pref_seed" "${PREF_MODEL}.new" 2>/dev/null &&
+            mv -f -- "${PREF_MODEL}.new" "${PREF_MODEL}" 2>/dev/null ||
+            rm -f -- "${PREF_MODEL}.new" 2>/dev/null
+    else
+        # opencode creates this itself on first write, but the mount point has to
+        # exist before bwrap starts, and bwrap cannot create one underneath a
+        # read-only bind.
+        printf '%s\n' '{"recent":[],"favorite":[],"variant":{}}' > "${PREF_MODEL}" 2>/dev/null || true
+    fi
+fi
+
+# The bind lands on the per-repo path, because that is where opencode looks:
+# XDG_STATE_HOME is redirected, so ${SBX}/state/opencode/model.json is the path
+# it opens. bwrap resolves the *source* in the host namespace, so the shared
+# copy stays reachable even though two of its ancestors are masked to empty
+# tmpfs further down - the state root that holds it, and the host's own state
+# directory. Same ordering the SSH socket bind relies on, and the reason this
+# mkdir matters: it is what puts an `opencode` directory inside the state
+# directory that --bind puts back, so the file bind below has a parent to land
+# on once the state root itself is a tmpfs.
+mkdir -p "${SBX}/state/opencode" 2>/dev/null || true
+# Only bind a source that exists. bwrap aborts on a missing bind source, and the
+# one thing this wrapper must never do is refuse to start over a preferences
+# file: with no bind, opencode creates and uses a per-repo model.json, which is
+# exactly how this behaved before any of it existed.
+prefs_args=()
+if [ -e "${PREF_MODEL}" ]; then
+    prefs_args=(--bind "${PREF_MODEL}" "${SBX}/state/opencode/model.json")
+else
+    echo "bubblewrap_opencode: no ${PREF_MODEL}; preferences stay per repo" >&2
+fi
+
+# OPENCODE_SANDBOX_HOST_PREFS=1 drops the shared copy and binds the host's own
+# model.json read-write instead, so the sandboxed and unsandboxed opencode edit
+# one file and stay in sync in both directions with nothing to seed or reconcile.
+#
+# This is the one place in this wrapper where a process inside the sandbox can
+# modify host state, which is why it is opt-in and off by default. What the file
+# is: {recent, favorite, variant}, i.e. a list of model ids. An agent can delete
+# the host's favourites and recents, insert entries, or set variant strings, and
+# those entries are what the host's model picker displays and what
+# model.cycle_favorite walks - so an agent could arrange for the user's
+# unsandboxed picker to land on a model id it chose. It cannot execute code,
+# cannot read credentials through this path, and cannot make the host fetch
+# anything: only ids already in the host's catalogue and resolvable by the
+# host's own provider have any effect. The worst realistic outcome is a
+# manipulated picker, in exchange for preferences that actually follow you.
+#
+# With this set, the host's model.json must exist for bwrap to have a source, so
+# create it if opencode on the host has not done so yet. That is a write to the
+# host from the wrapper, which is the same thing opencode itself would do on its
+# next start.
+if [ "${OPENCODE_SANDBOX_HOST_PREFS:-0}" = "1" ]; then
+    if [ ! -e "${HOST_STATE}/model.json" ]; then
+        : > "${HOST_STATE}/model.json" 2>/dev/null || true
+    fi
+    if [ -e "${HOST_STATE}/model.json" ]; then
+        prefs_args=(--bind "${HOST_STATE}/model.json" "${SBX}/state/opencode/model.json")
+        echo "bubblewrap_opencode: preferences are the host's own ${HOST_STATE}/model.json, writable from inside the sandbox" >&2
+    else
+        echo "bubblewrap_opencode: OPENCODE_SANDBOX_HOST_PREFS=1 but ${HOST_STATE}/model.json is not available; using the shared copy" >&2
+    fi
+fi
 
 # Build the full bwrap argument array
 bwrap_args=(
@@ -270,6 +506,11 @@ bwrap_args=(
     # server's service.json, ~900M of session history) and all of ~/.ssh, so
     # --ro-bind / / does not leave key material readable. The sandbox uses the
     # per-repo copy below instead.
+    #
+    # The host's ~/.config/opencode is *not* hidden, only unbound-writable: it
+    # stays readable, because the playbook it points at is the user's own
+    # configuration and hiding it would be surprising. The per-repo copy bound
+    # later is what opencode actually reads and writes.
     ${hide_dirs[@]+"${hide_dirs[@]}"}
 
     # Belt and braces: the credential paths are not writable either, so nothing
@@ -277,12 +518,22 @@ bwrap_args=(
     # read-only file: reads see nothing, writes fail, host copies untouched.
     ${mask_args[@]+"${mask_args[@]}"}
 
-    # This repo's persistent session state, plus the package-manager caches
-    # the read-only host toolchains cannot use (see the exports above).
+    # This repo's persistent session state, its own opencode config directory,
+    # the package-manager caches the read-only host toolchains cannot use (see
+    # the exports above), and the one file shared by every repo.
+    #
+    # These are also what puts this repo back after the state root was replaced
+    # by a tmpfs just above: the sources are resolved against the host
+    # filesystem, and the destinations are recreated inside that tmpfs, so from
+    # here the state root holds exactly this repo's directories and nothing else.
+    # ${SBX}/meta goes with it and is not bound back, which costs nothing: it is
+    # the wrapper's own bookkeeping, written and read only outside the sandbox.
     --bind "${SBX}/data"   "${SBX}/data"
     --bind "${SBX}/state"  "${SBX}/state"
     --bind "${SBX}/cache"  "${SBX}/cache"
     --bind "${SBX}/tools"  "${SBX}/tools"
+    --bind "${SBX}/config" "${SBX}/config"
+    ${prefs_args[@]+"${prefs_args[@]}"}
 
     # Add dev and proc special binds
     --dev /dev
@@ -305,7 +556,12 @@ bwrap_args=(
     # all of it, including ~/.cache/opencode. That directory used to be the one
     # writable host bind, because opencode downloads and executes provider
     # packages there; it is now a per-repo copy, so nothing on the host is
-    # writable except the working directory and this repo's state directory.
+    # writable except the working directory and this repo's own directories.
+    #
+    # The single exception is the preferences bind above, and only under
+    # OPENCODE_SANDBOX_HOST_PREFS=1, which makes the host's model.json writable
+    # on purpose so the sandboxed and unsandboxed opencode share it. It is a
+    # model id list and nothing else; the reasoning is in full at that bind.
 
     # Make the current directory writable
     --bind "${CURRENT_FOLDER}" "${CURRENT_FOLDER}"
