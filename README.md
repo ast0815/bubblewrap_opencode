@@ -33,7 +33,7 @@ can actually enforce on an unprivileged Linux host.
 | --- | --- |
 | **Host IPC control plane** | `$XDG_RUNTIME_DIR`, `/run/user/$(id -u)`, `/run/dbus` and `/run/systemd` are replaced with empty tmpfs mounts. This is what closed the `systemd-run --user` escape. |
 | **Ambient credentials** | The host originals — `~/.local/share/opencode/{auth,mcp-auth,account}.json` and `~/.local/state/opencode/service.json` — are masked with 0-byte read-only binds. The first three are copied once into `~/.local/share/opencode-sbx/<repo>-<hash>/data/opencode/` with mode `600` (`rw-------`, same as the host file), and the sandbox reads those copies instead. |
-| **Host session history** | `~/.local/share/opencode` (the 860 MB `opencode.db`) and `~/.local/state/opencode` are tmpfs-masked wholesale. |
+| **Host session history** | `~/.local/share/opencode` and `~/.local/state/opencode` are tmpfs-masked wholesale. |
 | **Key material** | `~/.ssh` is a tmpfs. No private key, `config` or `known_hosts` from the host is ever visible. |
 | **Kernel and namespaces** | `--unshare-all --share-net`, `--unshare-user --disable-userns`, `--cap-drop ALL`, `NoNewPrivs`. Nested user namespaces fail with `ENOSPC`, so a compromised process cannot build a second sandbox. |
 | **Code-execution via PATH** | `~/.bun` and `~/.local/share/uv/tools` are read-only, so a downloaded script cannot be edited into a host-side code-execution path. |
@@ -134,7 +134,7 @@ the run.
 | `~/.local/share/opencode/auth.json` | empty mask |
 | `~/.local/share/opencode/mcp-auth.json` | empty mask |
 | `~/.local/share/opencode/account.json` | empty mask |
-| `~/.local/share/opencode/opencode.db` (860 MB of sessions) | hidden, dir masked |
+| `~/.local/share/opencode/opencode.db` | hidden, dir masked |
 | `~/.ssh/id_ed25519`, `~/.ssh/id_rsa`, `~/.ssh/config` | hidden, dir masked |
 | per-repo `auth.json` copy | **present and non-empty (344 B)** — required |
 
