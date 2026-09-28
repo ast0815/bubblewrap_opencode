@@ -120,6 +120,64 @@ denied() {
     fi
 }
 
+# The wrapper's per-repo state root, recovered from the path it exported:
+# XDG_DATA_HOME is $SBX/data, so its parent is $SBX.
+#
+# One dirname, not two. Taking the grandparent yields the *base* that holds
+# every repo plus prefs/, which makes the classifier below call the shared
+# preferences file repo-local -- reporting exactly the sharing it is supposed
+# to reveal. The comment here used to say "grandparent" and was wrong.
+SBX_ROOT="$(dirname "${XDG_DATA_HOME:-/nonexistent/data}")"
+# The key is the directory name the wrapper derives from the repo path. It is
+# what distinguishes "this repo's own bind" from "a file shared with other
+# repos" in a mount root, robustly across filesystems -- see below.
+SBX_KEY="$(basename "${SBX_ROOT}")"
+
+# Inside the sandbox, or running on the host? The wrapper exports a set of
+# per-repo cache and tool directories that nothing else sets, and the one
+# chosen here is exactly $SBX_ROOT/tools/bin.
+#
+# XDG_DATA_HOME would be the obvious signal and is the wrong one: a normal
+# desktop session has it set to ~/.local/share. UV_TOOL_BIN_DIR pointing into
+# the wrapper's own state root is only ever true inside the sandbox.
+#
+# Worth noting that this is the same variable that used to abort this script
+# under `set -u` when it was unset, so a wrapper regression that stopped
+# exporting it surfaces here as "not in a sandbox" rather than silently as a
+# skipped check.
+IN_SANDBOX=0
+if [ -n "${UV_TOOL_BIN_DIR:-}" ] && [ -n "${XDG_DATA_HOME:-}" ]; then
+    case "$UV_TOOL_BIN_DIR" in
+        "$SBX_ROOT"/*) IN_SANDBOX=1 ;;
+    esac
+fi
+
+# Every variable reaching the report is expanded with a default. The script runs
+# under `set -u`, and a bare $VAR for something the wrapper only sets inside the
+# sandbox turns a missing variable into an aborted run instead of a reported
+# finding -- which is how running this on the host used to die halfway through
+# the writable-bounds list.
+
+if [ "$IN_SANDBOX" -eq 0 ]; then
+    # Heading at column 0 and a parenthetical, the way the section headers are
+    # written; then one aligned row per section saying what it is expected to
+    # report here. Outcomes are spelled out as words instead of reusing the
+    # report's own [ OK ]/FAIL colouring, because an expected result wearing the
+    # same colours as a real finding is how a host run reads as a broken sandbox.
+    printf '\n%sNOT INSIDE A SANDBOX%s  %s(this is the host, not a sandbox)%s\n' \
+        "$BOLD" "$OFF" "$DIM" "$OFF"
+    while IFS='|' read -r label outcome why; do
+        printf '    %-28s %-8s %s%s%s\n' "$label" "$outcome" "$DIM" "$why" "$OFF"
+    done <<'EOF'
+FUNCTIONALITY|pass|a host baseline, and nothing more
+OPENCODE CONFIG, PREFERENCES|fail|per-repo state exists only inside
+CROSS-REPO ISOLATION|[ OPEN ]|nothing is masked on a host
+HOST IPC, ESCAPE MECHANISMS|[ OPEN ]|a host really does have both
+EOF
+    printf '\n  %sOnly a session started by bubblewrap_opencode can say anything about the sandbox.%s\n' \
+        "$DIM" "$OFF"
+fi
+
 # ---------------------------------------------------------------- functional
 if [ "$WHICH" = all ] || [ "$WHICH" = functional ]; then
     section "FUNCTIONALITY (must keep working)"
@@ -159,18 +217,8 @@ if [ "$WHICH" = all ] || [ "$WHICH" = functional ]; then
     rm -f ./.selftest-probe /tmp/.selftest-probe 2>/dev/null
 
     printf '\n  %sbounds that are writable from inside%s\n' "$BOLD" "$OFF"
-    # The wrapper's per-repo state root, recovered from the path it exported:
-    # XDG_DATA_HOME is $SBX/data, so its parent is $SBX.
-    #
-    # One dirname, not two. Taking the grandparent yields the *base* that holds
-    # every repo plus prefs/, which makes the classifier below call the shared
-    # preferences file repo-local -- reporting exactly the sharing it is supposed
-    # to reveal. The comment here used to say "grandparent" and was wrong.
-    SBX_ROOT="$(dirname "${XDG_DATA_HOME:-/nonexistent/data}")"
-    # The key is the directory name the wrapper derives from the repo path. It is
-    # what distinguishes "this repo's own bind" from "a file shared with other
-    # repos" in a mount root, robustly across filesystems -- see below.
-    SBX_KEY="$(basename "${SBX_ROOT}")"
+    # $SBX_ROOT and $SBX_KEY are recovered at the top of the script, so the
+    # security section can classify the same paths without deriving them again.
     # Writable is only a problem when the write lands on a real host filesystem.
     # A tmpfs is writable but empty and discarded when the sandbox exits.
     #
@@ -193,7 +241,8 @@ if [ "$WHICH" = all ] || [ "$WHICH" = functional ]; then
     for d in "$HOME/.bun" "$HOME/.local/share/uv/tools" "$HOME/.local/state/opencode" \
              "$HOME/.local/share/opencode" "$HOME/.cache" "$HOME/.cache/opencode" \
              "$HOME/.config/opencode" "$HOME/.config/opencode/cli.json" \
-             "$XDG_CACHE_HOME" "$XDG_CACHE_HOME/opencode" "$HOME/.ssh" \
+             "${XDG_CACHE_HOME:-/nonexistent}" "${XDG_CACHE_HOME:-/nonexistent}/opencode" \
+             "$HOME/.ssh" \
              "${XDG_CONFIG_HOME:-$HOME/.config}" "${OPENCODE_CONFIG_DIR:-/nonexistent}" \
              "${XDG_STATE_HOME:-/nonexistent}/opencode/model.json"; do
         [ -e "$d" ] || continue
@@ -397,7 +446,7 @@ if [ "$WHICH" = all ] || [ "$WHICH" = toolchains ]; then
     run "npm install + require" - bash -c "cd '$W' && npm install --silent --no-audit --no-fund is-odd >/dev/null && node -e \"require('is-odd')\""
     run "bun add + import"     - bash -c "cd '$W' && bun add --silent left-pad >/dev/null && bun -e \"import p from 'left-pad'; p('x',2)\""
     run "uvx runs a package"   - bash -c "uvx --quiet cowsay -t moo >/dev/null"
-    run "uv tool install"      - bash -c "uv tool install --quiet ruff >/dev/null && '$UV_TOOL_BIN_DIR/ruff' --version"
+    run "uv tool install"      - bash -c "uv tool install --quiet ruff >/dev/null && '${UV_TOOL_BIN_DIR:-/nonexistent}/ruff' --version"
     run "pip in a venv"        - bash -c "cd '$W' && python3 -m venv v >/dev/null && ./v/bin/pip install -q requests >/dev/null && ./v/bin/python -c 'import requests'"
     rm -rf "$W"
 
@@ -509,11 +558,15 @@ raise SystemExit(0 if n==16 else 1)"
     done
 
     # The per-repo copy is the one that must be readable and non-empty.
+    # $XDG_DATA_HOME is defaulted once here rather than at each expansion: these
+    # are bare $VAR expansions under `set -u`, so an unset one aborts the report
+    # instead of printing a finding.
+    dh="${XDG_DATA_HOME:-/nonexistent}"
     for f in auth.json; do
-        if [ -s "${XDG_DATA_HOME:-/nonexistent}/opencode/$f" ]; then
-            ok "seeded per-repo copy: ${XDG_DATA_HOME}/opencode/$f ($(stat -c %s "${XDG_DATA_HOME}/opencode/$f") bytes)"
+        if [ -s "$dh/opencode/$f" ]; then
+            ok "seeded per-repo copy: $dh/opencode/$f ($(stat -c %s "$dh/opencode/$f") bytes)"
         else
-            bad "no usable per-repo copy of $f in ${XDG_DATA_HOME}/opencode/"
+            bad "no usable per-repo copy of $f in $dh/opencode/"
         fi
     done
 
@@ -547,10 +600,9 @@ raise SystemExit(0 if n==16 else 1)"
     # directories bound back in. This is the check that would catch a regression,
     # so it asserts visibility and writability, not just one of the two.
     section "CROSS-REPO ISOLATION (another repo's state is not reachable)"
-    # The per-repo state root is normally recovered in the functional section, so
-    # it is derived again here: the security section must also work on its own,
-    # and `set -u` would abort on an unset variable rather than skip the check.
-    sbx_root="$(dirname "${XDG_DATA_HOME:-/nonexistent/data}")"
+    # $SBX_ROOT, and with it the base that holds it, is recovered at the top of
+    # the script and shared with the functional section.
+    sbx_root="$SBX_ROOT"
     root="$(dirname "${sbx_root}")"
     # First the positive half, so the negative checks below cannot pass merely
     # because nothing was mounted at all.
