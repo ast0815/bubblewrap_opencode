@@ -32,7 +32,7 @@ can actually enforce on an unprivileged Linux host.
 | Area | How |
 | --- | --- |
 | **Host IPC control plane** | `$XDG_RUNTIME_DIR`, `/run/user/$(id -u)`, `/run/dbus` and `/run/systemd` are replaced with empty tmpfs mounts. This is what closed the `systemd-run --user` escape. |
-| **Ambient credentials** | `~/.local/share/opencode/{auth,mcp-auth,account}.json` and `~/.local/state/opencode/service.json` are masked with 0-byte read-only binds; a per-repo copy of the credentials is seeded at `600`. |
+| **Ambient credentials** | The host originals — `~/.local/share/opencode/{auth,mcp-auth,account}.json` and `~/.local/state/opencode/service.json` — are masked with 0-byte read-only binds. The first three are copied once into `~/.local/share/opencode-sbx/<repo>-<hash>/data/opencode/` with mode `600` (`rw-------`, same as the host file), and the sandbox reads those copies instead. |
 | **Host session history** | `~/.local/share/opencode` (the 860 MB `opencode.db`) and `~/.local/state/opencode` are tmpfs-masked wholesale. |
 | **Key material** | `~/.ssh` is a tmpfs. No private key, `config` or `known_hosts` from the host is ever visible. |
 | **Kernel and namespaces** | `--unshare-all --share-net`, `--unshare-user --disable-userns`, `--cap-drop ALL`, `NoNewPrivs`. Nested user namespaces fail with `ENOSPC`, so a compromised process cannot build a second sandbox. |
@@ -63,10 +63,11 @@ Read this section before trusting the thing.
   Other secrets in `$HOME` — other `~/.local/share/*` apps, `~/.gnupg`, browser
   profiles, `~/.config/*/credentials` — are readable and can be exfiltrated
   through the network. Only the opencode and ssh paths were handled.
-- **The seeded `auth.json` is readable and usable.** That is the point: the
-  sandbox needs credentials. It is a per-repo copy, so revoking is a matter of
-  deleting the state directory, but a compromised process can use it and can
-  read it out.
+- **The per-repo `auth.json` copy is readable and usable.** That is the point:
+  the sandbox needs credentials. It lives in plaintext at
+  `~/.local/share/opencode-sbx/<repo>-<hash>/data/opencode/auth.json`, one set
+  per repo, so revoking means deleting the state directory. A compromised
+  process can both use it and read it out.
 - **`/tmp` is RAM-backed and per-invocation.** Writable, but thrown away when
   the sandbox exits. Do not use it to carry state between runs.
 - **The per-repo state directory is on the host disk.** It is keyed on the git
@@ -205,13 +206,14 @@ Two things need a real interactive login to check, and were not verified here:
 | `OPENCODE_SANDBOX_SSH=1` | Forward the SSH **agent socket only** (plus a per-repo `known_hosts` copy, public keys). Without it, git-over-SSH fails to authenticate. Key material is never exposed either way. |
 | `OPENCODE_SANDBOX_EXEC=<cmd>` | Run `<cmd>` inside exactly the sandbox opencode would get, instead of opencode. Unset before exec so it cannot leak inward. |
 | `OPENCODE_SANDBOX_HOME=<dir>` | Override the state root. |
-| `OPENCODE_SANDBOX_RESET=1` | Delete this repo's `data/`, `state/` and `cache/` before starting. This is how you revoke the seeded credentials. |
+| `OPENCODE_SANDBOX_RESET=1` | Delete this repo's `data/`, `state/` and `cache/` before starting. This is how you revoke the copied credentials. |
 
 ## State layout
 
 ```
 ~/.local/share/opencode-sbx/<repo>-<sha256[:12]>/    # key = git toplevel basename + path hash
-├── data/opencode/     # XDG_DATA_HOME: seeded auth.json (600), opencode.db, storage, logs
+├── data/opencode/     # XDG_DATA_HOME: auth.json, mcp-auth.json, account.json (copies of the
+│                      # host files, mode 600), plus opencode.db, storage, logs
 ├── state/             # XDG_STATE_HOME: locks, prompt history, model.json
 ├── cache/{bun,npm,uv,pip}
 ├── tools/bin          # uv tool executables
