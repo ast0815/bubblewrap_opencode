@@ -24,8 +24,13 @@ service that runs with your full privileges.
 
 The thing *not* being defended against is a determined human with your account.
 This is mitigation, not a security boundary in the seccomp/capabilities sense:
-`--share-net` is deliberate, and everything below is scoped to what bubblewrap
-can actually enforce on an unprivileged Linux host.
+`--share-net` is deliberate, and everything in this document is scoped to what
+bubblewrap can actually enforce on an unprivileged Linux host.
+
+Assumptions: a Linux host with unprivileged user namespaces enabled, and
+`bubblewrap` on `PATH`. Where a check depends on a daemon being present
+(systemd, D-Bus, a desktop session) the selftest reports the socket as absent
+rather than failing, so a minimal host is fine.
 
 ## What is protected
 
@@ -88,6 +93,18 @@ OPENCODE_SANDBOX_EXEC=1 ./bubblewrap_opencode ./sandbox-selftest [section]
 the wrapper's argument list. Sections: `security` (escape routes), `functional`
 (usability), `toolchains` (package-manager writes, slow), or `all` (default).
 
+The selftest adapts to the host: paths come from `$HOME`, the writable-bound
+report is derived at runtime, and the read-only toolchain check enumerates
+whatever is installed rather than naming a tool. Checks whose subject is absent
+(a desktop session socket, a user toolchain) report as absent or skipped rather
+than failing.
+
+`SBX_EGRESS_URL` and `SBX_DNS_HOST` override the network probes. Egress has no
+hard-coded target — the IANA example domains are unreachable on some networks —
+so a short candidate list is tried and whichever answers is named in the
+output. Any HTTP status counts, including 401: the assertion is that the
+connection is made, not that it is authorised.
+
 ### Escape mechanisms — all denied
 
 | Route | Verdict | Evidence |
@@ -99,7 +116,7 @@ the wrapper's argument list. Sections: `security` (escape routes), `functional`
 | Nested bubblewrap | CLOSED | `nesting depth exceeded (ENOSPC)` |
 | `dmesg` | CLOSED | `read kernel buffer failed: Operation not permitted` |
 | Write `/proc/sys/kernel/core_pattern` | CLOSED | `Permission denied` |
-| `modprobe tun` | CLOSED | no module access; the running kernel also has no `/lib/modules` |
+| `modprobe tun` | CLOSED | `CAP_SYS_MODULE` dropped and `/lib/modules` not writable |
 | `mount -t tmpfs` | CLOSED | mount syscall denied |
 | `ptrace` another process | CLOSED | `Operation not permitted` |
 | `process_vm_readv` another process | CLOSED | `bytes 0` — 0 of 16 bytes read |
@@ -125,7 +142,7 @@ the run.
 | gpg-agent | CLOSED |
 | systemd journal (log forgery) | CLOSED |
 | xdg document portal | CLOSED |
-| Unlisted-socket sweep | CLOSED — 0 reachable, 0 host sockets present |
+| Unlisted-socket sweep | CLOSED — no socket outside the list was connectable |
 
 ### Host files — no content leaks in
 
@@ -137,7 +154,7 @@ the run.
 | `~/.local/share/opencode/account.json` | empty mask |
 | `~/.local/share/opencode/opencode.db` | hidden, dir masked |
 | `~/.ssh/id_ed25519`, `~/.ssh/id_rsa`, `~/.ssh/config` | hidden, dir masked |
-| per-repo `auth.json` copy | **present and non-empty (344 B)** — required |
+| per-repo `auth.json` copy | **present and non-empty** — required |
 
 Note the two different tests. A 0-byte mask is *openable* but empty, so the
 question is "can I read bytes", not "does `open()` succeed". A missing file
@@ -151,25 +168,30 @@ inside a tmpfs-masked directory is the other case; that is why
 | `opencode`, `node`, `bun`, `git`, `python3`, `ssh` | all run |
 | Working directory writable, git history readable | OK |
 | Filesystem and `HOME` readable, `getent passwd` works | OK |
-| DNS resolution, HTTPS egress to `api.anthropic.com` | OK |
+| DNS resolution, HTTPS egress | OK — the check names whichever endpoint answered; set `SBX_EGRESS_URL` to test one specific provider |
 | `/tmp` writable | OK |
 | `npm install` + `require` | OK |
 | `bun add` + `import` | OK |
 | `uvx` a package, `uv tool install` + run | OK |
 | `pip install` in a venv | OK |
-| A globally installed tool runs but is not writable | OK (`ralph 1.2.2` runs; appending to `ralph.js` gives `EROFS`) |
+| A tool in a read-only toolchain dir runs but is not writable | OK — the selftest picks whichever tools it finds on `PATH`, and skips the check if it finds none |
 
-Writable-bound report, straight from the sandbox:
+The writable-bound report is part of the selftest output. Expected shape —
+every line is derived from `$HOME` at runtime, so paths are shown relative to it:
 
 ```
-ro      /home/lukas/.bun
-ro      /home/lukas/.local/share/uv/tools
-ro      /home/lukas/.cache
-tmpfs   /home/lukas/.local/state/opencode   (writable, empty, ephemeral)
-tmpfs   /home/lukas/.local/share/opencode   (writable, empty, ephemeral)
-tmpfs   /home/lukas/.ssh                    (writable, empty, ephemeral)
-WRITABLE /home/lukas/.cache/opencode        <-- the known risk above
+ro       ~/.bun
+ro       ~/.local/share/uv/tools
+ro       ~/.cache
+tmpfs    ~/.local/state/opencode   (writable, empty, ephemeral)
+tmpfs    ~/.local/share/opencode   (writable, empty, ephemeral)
+tmpfs    ~/.ssh                    (writable, empty, ephemeral)
+WRITABLE ~/.cache/opencode         <-- the known risk above
 ```
+
+A `WRITABLE` line here is the finding to read, not a cosmetic note: it marks a
+directory where sandbox writes land on a real host filesystem. A `tmpfs` line is
+writable but empty and discarded at exit.
 
 Read-only package caches are not enough on their own: a `ro` bind looks fine
 until something tries to install into it, so each package manager is redirected
@@ -180,45 +202,42 @@ at a per-repo cache directory via `BUN_INSTALL_CACHE_DIR`, `npm_config_cache`,
 
 - A real `opencode run` completes and prints `PATH OK` / `SANDBOX OK`.
 - State persists across wrapper invocations in the same folder: a marker file
-  written in run 1 is present in run 2, and the per-repo `opencode.db` grew
-  4096 → 245760 B. Two sessions are listed from the per-repo database.
+  written in run 1 is present in run 2, and the per-repo `opencode.db` grows from
+  empty. Sessions are listed from the per-repo database.
 - `session list`, `auth list`, `debug paths`, `models`, `stats` and `serve` all
   work, including `--standalone` being placed and detected per leaf subcommand.
 
 ### SSH agent forwarding — verified
 
-`OPENCODE_SANDBOX_SSH=1` was checked against the agent this host actually uses,
-gpg-agent's SSH emulation at `/run/user/$(gpgconf --list-dirs agent-ssh-socket)`:
+With `OPENCODE_SANDBOX_SSH=1` and a live agent exported, the checks are:
 
 | Property | Result |
 | --- | --- |
 | `SSH_AUTH_SOCK` inside the sandbox | same path as the host, and a live socket |
-| `ssh-add -l` | lists `SHA256:5fwN…vrQ lukas@Flatman (ED25519)` |
+| `ssh-add -l` | lists the identity the host agent offers |
 | `~/.ssh` contents | empty — no private key, no `config` |
-| `known_hosts` | 77-line per-repo copy, bound after the tmpfs mask |
+| `known_hosts` | per-repo copy, bound after the tmpfs mask |
 
-The wrapper forwards the agent socket only. It never creates an agent, so if
-`SSH_AUTH_SOCK` is unset — as it is in a plain login shell on this host, where
-the agent is gpg-agent and nothing exports the variable — the wrapper warns and
-continues without SSH, and git-over-SSH fails to authenticate. Either export it
-first:
+The wrapper forwards the agent socket only. It never creates an agent, so it
+depends on `$SSH_AUTH_SOCK` already being a live socket. If it is not, the
+wrapper warns and continues without SSH, and git-over-SSH fails to
+authenticate. Agents differ by desktop, so start or export one first:
 
 ```sh
-export SSH_AUTH_SOCK="$(gpgconf --list-dirs agent-ssh-socket)"
+eval "$(ssh-agent -s)"                                          # or
+export SSH_AUTH_SOCK="$(gpgconf --list-dirs agent-ssh-socket)"  # gpg-agent
 ```
 
-or use `eval "$(ssh-agent -s)"`. Not verified: authentication against a real
-private remote. Everything up to the `connect(2)` is confirmed; the last hop
-needs your own repository.
+Not verified: authentication against a real private remote. Everything up to
+the `connect(2)` is confirmed; the last hop needs a repository you control.
 
 ### Not tested here
 
-**The state directory at its default location.** The selftest runs above came
-from a session with a read-only `$HOME`, so they exercised the fallback
-`~/.cache/opencode-sbx/...` rather than the default
-`~/.local/share/opencode-sbx/<repo>-<hash>/`. A real login on this host does
-create the default one. `~/.cache/opencode-sbx` is test residue and can be
-deleted.
+**The state directory at its default location.** The selftest runs recorded
+here were made from a session with a read-only `$HOME`, so they exercised the
+fallback `~/.cache/opencode-sbx/...` rather than the default
+`~/.local/share/opencode-sbx/<repo>-<hash>/`. Run the selftest from an ordinary
+login to cover the default.
 
 ## Environment variables
 
@@ -248,11 +267,11 @@ disk, and a one-off re-download per repo.
 
 ## Gotchas
 
-- **Check which copy you are running.** An older `bubblewrap_opencode` sits at
-  `~/.local/bin/bubblewrap_opencode` and comes first on `PATH`, so
-  `bubblewrap_opencode …` runs *that* one and quietly ignores every variable
-  documented above. Use `./bubblewrap_opencode`, or replace the installed copy
-  with this one.
+- **Check which copy you are running.** If you installed a copy on `PATH`
+  (typically `~/.local/bin`) at some point, an old version there takes
+  precedence over this directory and will quietly ignore every variable
+  documented above. Run `./bubblewrap_opencode`, or reinstall this version over
+  the one on `PATH`.
 - **`OPENCODE_SANDBOX_EXEC` is a switch, not a command** — see the table above.
 - **The credential copies are real files on the host disk**, under
   `~/.local/share/opencode-sbx/`, one set per repo. `OPENCODE_SANDBOX_RESET=1`

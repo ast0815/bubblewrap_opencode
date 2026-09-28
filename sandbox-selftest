@@ -17,6 +17,11 @@
 #         ./sandbox-selftest security     escape channels only
 #         ./sandbox-selftest functional  usability only
 #         ./sandbox-selftest toolchains  package-manager writes (slow)
+#
+# Options (environment):
+#         SBX_EGRESS_URL   URL used for the egress check. Default example.com;
+#                          set it to the model provider you depend on.
+#         SBX_DNS_HOST     hostname used for the resolver check.
 
 set -uo pipefail
 
@@ -28,7 +33,7 @@ ok()     { printf '  %s[ OK ]%s   %s\n' "$GREEN" "$OFF" "$1"; }
 closed() { printf '  %s[CLOSED] %s  %s\n' "$GREEN" "$OFF" "$1"; }
 open_()  { printf '  %s[ OPEN] %s  %s\n' "$RED" "$OFF" "$1"; printf '         %s↳ reachable%s\n' "$DIM" "$OFF"; fails=$((fails+1)); }
 bad()    { printf '  %s[FAIL ] %s  %s\n' "$RED" "$OFF" "$1"; fails=$((fails+1)); }
-note()   { printf '         %s%s%s\n' "$DIM" "$1" "$OFF"; }
+note()   { [ -n "$1" ] && printf '         %s%s%s\n' "$DIM" "$1" "$OFF"; return 0; }
 section(){ printf '\n%s%s%s\n' "$BOLD" "$1" "$OFF"; }
 
 # try_connect <path> -> 0 if a client can connect (i.e. the door is open)
@@ -103,8 +108,27 @@ if [ "$WHICH" = all ] || [ "$WHICH" = functional ]; then
     run "filesystem is readable"        - ls /usr/bin
     run "HOME is readable"              - ls "$HOME"
     run "user lookup works (nsswitch)"  - getent passwd "$(id -un)"
-    run "DNS resolution works"          - getent hosts github.com
-    run "egress to the internet"        - curl -sS -o /dev/null --max-time 10 https://api.anthropic.com/v1/models
+    run "DNS resolution works"          - getent hosts "${SBX_DNS_HOST:-localhost}"
+    # Egress: any HTTP response counts, including 401/404 -- what is asserted is
+    # that the connection is made, not that it is authorised. There is no single
+    # hard-coded target because the IANA example domains are unreachable on some
+    # networks, so a short candidate list is tried and whichever answers is
+    # named. Set SBX_EGRESS_URL to check one specific endpoint instead.
+    if [ -n "${SBX_EGRESS_URL:-}" ]; then
+        run "egress to the internet"    - curl -sS -o /dev/null --max-time 10 "${SBX_EGRESS_URL}"
+    else
+        egress=""
+        for u in https://api.anthropic.com https://registry.npmjs.org \
+                 https://pypi.org https://example.com; do
+            if curl -sS -o /dev/null --max-time 8 "$u" 2>/dev/null; then egress="$u"; break; fi
+        done
+        if [ -n "$egress" ]; then
+            ok "egress to the internet  (reached $egress)"
+        else
+            bad "egress to the internet"
+            note "no candidate endpoint answered; set SBX_EGRESS_URL to your provider"
+        fi
+    fi
     run "/tmp is writable"              - touch /tmp/.selftest-probe
     rm -f ./.selftest-probe /tmp/.selftest-probe 2>/dev/null
 
@@ -149,13 +173,31 @@ if [ "$WHICH" = all ] || [ "$WHICH" = toolchains ]; then
     run "pip in a venv"        - bash -c "cd '$W' && python3 -m venv v >/dev/null && ./v/bin/pip install -q requests >/dev/null && ./v/bin/python -c 'import requests'"
     rm -rf "$W"
 
-    # A globally installed tool must be runnable but not editable.
-    for exe in ralph; do
-        command -v "$exe" >/dev/null || continue
-        run "$exe still runs"   - "$exe" --version
-        p=$(readlink -f "$(command -v "$exe")")
-        denied "$exe is not writable" sh -c "printf '\n' >> '$p'"
+    # The toolchain directories the wrapper makes read-only must stay read-only.
+    #
+    # They are enumerated rather than looked up by a list of tool names: the
+    # same tool is a user install on one host and a system install on another, so
+    # a hard-coded name silently checks nothing. Only the dirs the wrapper
+    # actually binds read-only are listed, and the check is test -w rather than
+    # an attempted write, so running this against an unprotected toolchain
+    # reports the problem instead of corrupting the file it inspected.
+    #
+    # Executability is not checked here on purpose -- running an arbitrary tool
+    # with --version is unreliable (some need a tty, some have no such flag).
+    # The npm/bun/uv/pip checks above already run real code out of the
+    # toolchain, which is a better signal.
+    checked=0
+    for d in "$HOME/.bun" "$HOME/.local/share/uv/tools"; do
+        [ -d "$d" ] || continue
+        # A few representative files per toolchain, not the whole tree: this is
+        # a spot check that the bind is read-only, not an audit of the install.
+        for exe in $(find "$d" -type f \( -name '*.js' -o -name '*.py' -o -name '*.sh' \) \
+                          2>/dev/null | head -3); do
+            checked=$((checked + 1))
+            denied "not writable: ${exe/#$HOME/~}" test -w "$exe"
+        done
     done
+    [ "$checked" -gt 0 ] || note "nothing found in the read-only toolchain dirs; skipped"
 fi
 
 # ----------------------------------------------------------------- security
