@@ -80,12 +80,13 @@ Read this section before trusting the thing.
 claim in this table, and every row was re-run at the commit that added this
 README.
 
-```
-OPENCODE_SANDBOX_EXEC=1 ./bubblewrap_opencode ./sandbox-selftest
+```sh
+OPENCODE_SANDBOX_EXEC=1 ./bubblewrap_opencode ./sandbox-selftest [section]
 ```
 
-Sections: `security` (escape routes), `functional` (usability), `toolchains`
-(package-manager writes, slow), or `all`.
+`OPENCODE_SANDBOX_EXEC` is just a switch; the command run inside the sandbox is
+the wrapper's argument list. Sections: `security` (escape routes), `functional`
+(usability), `toolchains` (package-manager writes, slow), or `all` (default).
 
 ### Escape mechanisms — all denied
 
@@ -204,7 +205,7 @@ Two things need a real interactive login to check, and were not verified here:
 | Variable | Effect |
 | --- | --- |
 | `OPENCODE_SANDBOX_SSH=1` | Forward the SSH **agent socket only** (plus a per-repo `known_hosts` copy, public keys). Without it, git-over-SSH fails to authenticate. Key material is never exposed either way. |
-| `OPENCODE_SANDBOX_EXEC=<cmd>` | Run `<cmd>` inside exactly the sandbox opencode would get, instead of opencode. Unset before exec so it cannot leak inward. |
+| `OPENCODE_SANDBOX_EXEC` | Any non-empty value makes the wrapper run its **own arguments** inside exactly the sandbox opencode would get, instead of running opencode. The value is only a switch, never the command — so `OPENCODE_SANDBOX_EXEC=1 ./bubblewrap_opencode hostname` prints `opencode-sandbox`, and `./bubblewrap_opencode hostname` without it runs opencode and errors. Unset before exec so it cannot leak inward. |
 | `OPENCODE_SANDBOX_HOME=<dir>` | Override the state root. |
 | `OPENCODE_SANDBOX_RESET=1` | Delete this repo's `data/`, `state/` and `cache/` before starting. This is how you revoke the copied credentials. |
 
