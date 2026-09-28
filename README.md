@@ -185,26 +185,46 @@ at a per-repo cache directory via `BUN_INSTALL_CACHE_DIR`, `npm_config_cache`,
 - `session list`, `auth list`, `debug paths`, `models`, `stats` and `serve` all
   work, including `--standalone` being placed and detected per leaf subcommand.
 
+### SSH agent forwarding — verified
+
+`OPENCODE_SANDBOX_SSH=1` was checked against the agent this host actually uses,
+gpg-agent's SSH emulation at `/run/user/$(gpgconf --list-dirs agent-ssh-socket)`:
+
+| Property | Result |
+| --- | --- |
+| `SSH_AUTH_SOCK` inside the sandbox | same path as the host, and a live socket |
+| `ssh-add -l` | lists `SHA256:5fwN…vrQ lukas@Flatman (ED25519)` |
+| `~/.ssh` contents | empty — no private key, no `config` |
+| `known_hosts` | 77-line per-repo copy, bound after the tmpfs mask |
+
+The wrapper forwards the agent socket only. It never creates an agent, so if
+`SSH_AUTH_SOCK` is unset — as it is in a plain login shell on this host, where
+the agent is gpg-agent and nothing exports the variable — the wrapper warns and
+continues without SSH, and git-over-SSH fails to authenticate. Either export it
+first:
+
+```sh
+export SSH_AUTH_SOCK="$(gpgconf --list-dirs agent-ssh-socket)"
+```
+
+or use `eval "$(ssh-agent -s)"`. Not verified: authentication against a real
+private remote. Everything up to the `connect(2)` is confirmed; the last hop
+needs your own repository.
+
 ### Not tested here
 
-Two things need a real interactive login to check, and were not verified here:
-
-1. **git over SSH with a live agent.** `OPENCODE_SANDBOX_SSH=1` was verified
-   against a real `ssh-agent` at the production socket path: the identity was
-   listed, and no key material was present. But it was not tested against a real
-   remote repository. Try `git ls-remote git@github.com:you/yourrepo` with the
-   flag set.
-2. **The state directory at its default location.** The tests above ran from
-   inside an older sandbox whose `$HOME` was read-only, so they used the
-   fallback `~/.cache/opencode-sbx/...`. On a normal host the default
-   `~/.local/share/opencode-sbx/<repo>-<hash>/` applies. `~/.cache/opencode-sbx`
-   is test residue and can be deleted.
+**The state directory at its default location.** The selftest runs above came
+from a session with a read-only `$HOME`, so they exercised the fallback
+`~/.cache/opencode-sbx/...` rather than the default
+`~/.local/share/opencode-sbx/<repo>-<hash>/`. A real login on this host does
+create the default one. `~/.cache/opencode-sbx` is test residue and can be
+deleted.
 
 ## Environment variables
 
 | Variable | Effect |
 | --- | --- |
-| `OPENCODE_SANDBOX_SSH=1` | Forward the SSH **agent socket only** (plus a per-repo `known_hosts` copy, public keys). Without it, git-over-SSH fails to authenticate. Key material is never exposed either way. |
+| `OPENCODE_SANDBOX_SSH=1` | Forward the SSH **agent socket only** (plus a per-repo `known_hosts` copy, public keys). Requires `$SSH_AUTH_SOCK` to already be a live socket — the wrapper never starts an agent, and warns and continues if it is not set. Key material is never exposed either way. |
 | `OPENCODE_SANDBOX_EXEC` | Any non-empty value makes the wrapper run its **own arguments** inside exactly the sandbox opencode would get, instead of running opencode. The value is only a switch, never the command — so `OPENCODE_SANDBOX_EXEC=1 ./bubblewrap_opencode hostname` prints `opencode-sandbox`, and `./bubblewrap_opencode hostname` without it runs opencode and errors. Unset before exec so it cannot leak inward. |
 | `OPENCODE_SANDBOX_HOME=<dir>` | Override the state root. |
 | `OPENCODE_SANDBOX_RESET=1` | Delete this repo's `data/`, `state/` and `cache/` before starting. This is how you revoke the copied credentials. |
@@ -225,3 +245,17 @@ Two things need a real interactive login to check, and were not verified here:
 It lives outside the repository on purpose: `git clean -fdx` or deleting a
 worktree would otherwise destroy irreplaceable session history. The cost is
 disk, and a one-off re-download per repo.
+
+## Gotchas
+
+- **Check which copy you are running.** An older `bubblewrap_opencode` sits at
+  `~/.local/bin/bubblewrap_opencode` and comes first on `PATH`, so
+  `bubblewrap_opencode …` runs *that* one and quietly ignores every variable
+  documented above. Use `./bubblewrap_opencode`, or replace the installed copy
+  with this one.
+- **`OPENCODE_SANDBOX_EXEC` is a switch, not a command** — see the table above.
+- **The credential copies are real files on the host disk**, under
+  `~/.local/share/opencode-sbx/`, one set per repo. `OPENCODE_SANDBOX_RESET=1`
+  deletes them.
+- **`--ro-bind / /` hides nothing.** Read-only is not invisible; see the risk
+  list above.

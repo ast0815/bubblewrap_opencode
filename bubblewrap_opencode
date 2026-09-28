@@ -40,7 +40,13 @@ SBX=""
 for base in "${OPENCODE_SANDBOX_HOME:-${HOME}/.local/share/opencode-sbx}" \
             "${XDG_CACHE_HOME}/opencode-sbx" \
             "${TMPDIR:-/tmp}/opencode-sbx"; do
-    if mkdir -p "${base}/${SBX_KEY}/data/opencode" "${base}/${SBX_KEY}/state" 2>/dev/null; then
+    # mkdir -p is not a writability test: it succeeds on an already-existing
+    # directory even on a read-only filesystem, so probing with it alone picks
+    # an unusable base whenever the state dir was created earlier by a run with
+    # a writable $HOME. The empty redirect is the real test.
+    if mkdir -p "${base}/${SBX_KEY}/data/opencode" "${base}/${SBX_KEY}/state" 2>/dev/null &&
+       ( : > "${base}/${SBX_KEY}/.writable" ) 2>/dev/null; then
+        rm -f -- "${base}/${SBX_KEY}/.writable"
         SBX="${base}/${SBX_KEY}"
         SBX_PARENT="${base}"
         [ "${base}" = "${OPENCODE_SANDBOX_HOME:-${HOME}/.local/share/opencode-sbx}" ] || \
