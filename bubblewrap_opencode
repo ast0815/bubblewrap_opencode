@@ -358,6 +358,83 @@ for f in auth.json mcp-auth.json account.json; do
     fi
 done
 
+# --- Provider credentials: the rows opencode v2 reads --------------------------
+# The files above are opencode's *v1* credential store. v2 keeps provider API
+# keys in the `credential` table of its own database, and does not reliably
+# import them from those files into a fresh one: measured on v2.0.11, the
+# legacy import migration runs to completion on a new database and still
+# leaves the table empty. With no rows, sandboxed opencode sends provider
+# requests with no Authorization header and the provider answers 401 - while
+# the key sits unused in the auth.json copied just above. So the rows are
+# copied across too.
+#
+# Only the credential rows cross over. The host's database - every session,
+# every message - stays behind the mask; this repo gets its own database with
+# its own history. The host file is attached read-only, so even though the
+# background service is writing to it, this connection can only SELECT.
+#
+# Same seed rule as the files: an empty store means "not seeded yet", so
+# OPENCODE_SANDBOX_RESET=1 (which drops this repo's data/) re-seeds on the
+# next start, and no marker file can outlive what it vouches for.
+#
+# OPENCODE_VERSION and want_standalone are computed here rather than at the
+# --standalone argument juggling at the bottom, because both that code and
+# this seed need them and each version question costs a process start.
+OPENCODE_VERSION="$("$REAL_COMMAND" --version 2>/dev/null || true)"
+case "$OPENCODE_VERSION" in
+    *v[2-9].*) want_standalone=1 ;;
+    *)         want_standalone=0 ;;
+esac
+HOST_DB="${HOST_DATA}/opencode.db"
+REPO_DB="${SBX}/data/opencode/opencode.db"
+if [ "${want_standalone}" = 1 ]; then
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        echo "bubblewrap_opencode: sqlite3 not found; provider credentials are not seeded into this repo" >&2
+    elif [ -r "${HOST_DB}" ]; then
+        # A database opencode has never opened has no credential table, and
+        # creating one by hand does not work: opencode's own migrations reject
+        # a pre-existing table and the whole bootstrap aborts (measured). So
+        # the schema comes from opencode itself, once, with a blank config so
+        # this call loads no provider and starts no MCP server, and
+        # --standalone so no background service is registered. If it fails,
+        # seeding waits for a later start instead - every later start finds
+        # the table, and the retry costs one sqlite3 count per wrapper run.
+        cred_rows() {
+            [ -f "${REPO_DB}" ] || return 1
+            sqlite3 -cmd '.timeout 2000' "${REPO_DB}" \
+                'SELECT COUNT(*) FROM credential' 2>/dev/null
+        }
+        if ! cred_rows >/dev/null 2>&1; then
+            if command -v timeout >/dev/null 2>&1 && tmp_cfg="$(mktemp -d 2>/dev/null)"; then
+                OPENCODE_CONFIG_DIR="${tmp_cfg}" timeout 60 "${REAL_COMMAND}" \
+                    session list --standalone </dev/null >/dev/null 2>&1 || true
+                rm -rf -- "${tmp_cfg}"
+            fi
+        fi
+        rows="$(cred_rows)" || rows=""
+        case "${rows}" in
+            0)
+                # Any quote in the host path is doubled so it survives the
+                # ATTACH; the file: URI with mode=ro is what makes the host
+                # database impossible to write; INSERT OR IGNORE keeps a second
+                # seed over an already-populated table a no-op.
+                if ! sqlite3 -cmd '.timeout 2000' "${REPO_DB}" \
+                    "ATTACH DATABASE 'file:${HOST_DB//\'/\'\'}?mode=ro' AS host;
+                     INSERT OR IGNORE INTO credential SELECT * FROM host.credential;
+                     DETACH DATABASE host;" 2>/dev/null; then
+                    echo "bubblewrap_opencode: could not copy credential rows from ${HOST_DB}" >&2
+                fi
+                ;;
+            "")
+                echo "bubblewrap_opencode: no credential table in ${REPO_DB}; provider credentials are not seeded (a later start retries)" >&2
+                ;;
+            *)
+                : # already seeded; an ordinary writable part of this repo's state
+                ;;
+        esac
+    fi
+fi
+
 # --- Favourites and recent models: one file, shared by every repo -------------
 # opencode keeps the model picker state in $XDG_STATE_HOME/opencode/model.json
 # as {recent, favorite, variant}, and XDG_STATE_HOME is per repo, so without
@@ -635,11 +712,10 @@ fi
 # So the argument list is split into the subcommand path and the rest, the
 # binary is asked whether that exact path accepts the flag, and the answer is
 # cached per version because each question costs a process start.
-OPENCODE_VERSION="$("$REAL_COMMAND" --version 2>/dev/null || true)"
-case "$OPENCODE_VERSION" in
-    *v[2-9].*) want_standalone=1 ;;
-    *)           want_standalone=0 ;;
-esac
+# OPENCODE_VERSION and want_standalone are computed in the credentials
+# section above, where the credential-row seed needs them too.
+OPENCODE_VERSION="${OPENCODE_VERSION:-}"
+want_standalone="${want_standalone:-0}"
 
 # The leading run of non-flag arguments is the subcommand path. Anything longer
 # than three words is a command's own arguments (`run "some long message"`), so

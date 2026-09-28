@@ -53,7 +53,9 @@ just documentation — read it before changing behaviour.
 - The host's `~/.config/opencode` readable (only not writable), so a dotfiles
   symlink keeps resolving.
 - The per-repo `data/opencode/auth.json` is a real, readable, mode-600 credential
-  copy on the host disk. `OPENCODE_SANDBOX_RESET=1` is how you revoke it.
+  copy on the host disk, and the v2 provider credential rows are seeded the same
+  way into the per-repo `opencode.db` — rows only, the host database itself never
+  crosses over. `OPENCODE_SANDBOX_RESET=1` is how you revoke both.
 - The two-repos-writing-`model.json` lock race is documented, not fixed.
 - The state root is a masked tmpfs, so sibling repos are invisible from inside —
   a tool that walks it will under-report. That is the intended answer.

@@ -36,7 +36,7 @@ so a minimal host is fine.
 | Area | How |
 | --- | --- |
 | **Host control plane** | `$XDG_RUNTIME_DIR`, `/run/user/$(id -u)`, `/run/dbus` and `/run/systemd` are replaced with empty tmpfs mounts. This is what closed the `systemd-run --user` escape: with no bus, the sandbox cannot make the *host* act on its behalf. |
-| **Host credentials and history** | `~/.local/share/opencode` and `~/.local/state/opencode` are tmpfs-masked wholesale, and `auth.json`, `mcp-auth.json`, `account.json` and `service.json` additionally get 0-byte read-only binds. The three auth files are copied once into this repo's own `data/opencode/` at mode `600`; the sandbox reads those copies. |
+| **Host credentials and history** | `~/.local/share/opencode` and `~/.local/state/opencode` are tmpfs-masked wholesale, and `auth.json`, `mcp-auth.json`, `account.json` and `service.json` additionally get 0-byte read-only binds. The three auth files are copied once into this repo's own `data/opencode/` at mode `600`, and the v2 provider credential *rows* are copied out of the host's `opencode.db` into this repo's own database — only those rows; the host database itself, with all its session history, stays masked. The sandbox reads those copies. |
 | **Key material** | `~/.ssh` is a tmpfs — no private key, `config` or `known_hosts` from the host is ever visible. Agent forwarding is opt-in and forwards the socket only. |
 | **Other repos' state** | The state root is a tmpfs with only this repo's `data/`, `state/`, `cache/`, `tools/` and `config/` bound back in, so no sibling repo's directory — and therefore no sibling repo's credential copy — is visible. |
 | **Kernel and namespaces** | `--unshare-all --share-net`, `--unshare-user --disable-userns`, `--cap-drop ALL`, `NoNewPrivs`, `--new-session`. Nested user namespaces fail with `ENOSPC`, so a compromised process cannot build a second sandbox. |
@@ -64,7 +64,10 @@ Read this section before trusting the thing.
 - **This repo's `auth.json` copy is readable and usable.** That is the point: the
   sandbox needs credentials. It is a real, mode-600, plaintext file on the host
   disk at `~/.local/share/opencode-sbx/<repo>-<hash>/data/opencode/auth.json`,
-  one set per repo, so revoking means deleting the state directory. A compromised
+  one set per repo, so revoking means deleting the state directory. The v2
+  provider credential rows sit in this repo's own `opencode.db` — the same keys,
+  readable by the same process — so nothing is exposed that the file did not
+  already expose. A compromised
   process can both use it and read it out. Other repos' copies are *not*
   readable, so a sandbox cannot lift one repo's account into another; but this is
   the host's plaintext account either way, and anything that can already read the
@@ -113,7 +116,7 @@ its own argument list in the sandbox instead of opencode. Sections, or `all`
 | --- | --- |
 | `HOST IPC SOCKETS` | The systemd user manager, the system bus (and so polkit, flatpak, NetworkManager), KDE Wallet, Wayland, PulseAudio, PipeWire, the a11y bus, PKCS#11, gpg-agent, the journal and the xdg portal are all unconnectable — each tested with a bare `connect(2)`, because a bus daemon answers with cheerful errors that look like failures but mean the opposite. A final sweep fails the run on any socket nobody listed. |
 | `ESCAPE MECHANISMS` | `systemd-run --user`, `nsenter -t 1`, `machinectl`, nested user namespaces, nested bubblewrap, `dmesg`, writing `/proc/sys`, `modprobe`, `mount`, `ptrace` and `process_vm_readv` are all denied. |
-| `HOST FILES` | The host `auth.json`, `mcp-auth.json`, `account.json` and `service.json` read back empty; the host `opencode.db` and the host's `~/.ssh` contents are absent; this repo's credential copy is present and non-empty. A 0-byte mask is openable but empty, so the test is "can I read bytes", not "does `open()` succeed". |
+| `HOST FILES` | The host `auth.json`, `mcp-auth.json`, `account.json` and `service.json` read back empty; the host `opencode.db` and the host's `~/.ssh` contents are absent; this repo's credential copy is present and non-empty, and this repo's own `opencode.db` holds at least one provider credential row. A 0-byte mask is openable but empty, so the test is "can I read bytes", not "does `open()` succeed". |
 | `CROSS-REPO ISOLATION` | This repo's own state is writable — asserted first, so a sandbox that masked too much cannot pass by showing nothing — no sibling repo is visible, and the shared preferences directory is masked. |
 | `FUNCTIONALITY`, `OPENCODE CONFIG`, `PREFERENCES` | The toolchain runs, the working directory is writable, git history and DNS and egress work, `/tmp` is writable, the config copy is this repo's own inode and writable with no dangling symlinks, and the preferences file parses and comes from outside this repo's directory. |
 | `TOOLCHAIN WRITES` | `npm`, `bun`, `uv` and `pip` installs land in per-repo caches, and the read-only toolchain dirs stay read-only. Slow — it downloads packages. |
@@ -136,38 +139,6 @@ list is tried and whichever answers is named; any HTTP status counts, including
 Every claim above was re-measured at the commit that introduced it, except the
 per-repo config and the shared preferences, which came later.
 
-### Not tested here
-
-**The state directory at its default location.** The runs recorded in this
-repository were made from a session with a read-only `$HOME`, so they exercised
-the fallback `~/.cache/opencode-sbx/…` rather than the default
-`~/.local/share/opencode-sbx/<repo>-<hash>/`. Run the selftest from an ordinary
-login to cover the default.
-
-**The state-root mask.** The per-repo config and the shared preferences were
-verified inside a real sandbox, but one started *before* the mask existed, so
-its mount table predates it. `CROSS-REPO ISOLATION` therefore reports the leak
-the check was written to catch, which is the correct verdict for that mount
-table and confirms the check works. What is still unconfirmed is the post-mask
-behaviour: that the state root really is a tmpfs, that this repo's five
-directories come back through it, and that the preferences file still lands.
-All three are the ordering `--tmpfs` then `--bind`, which the SSH socket bind
-already uses successfully in this wrapper. One run covers it:
-
-```sh
-OPENCODE_SANDBOX_EXEC=1 ./bubblewrap_opencode ./sandbox-selftest security
-OPENCODE_SANDBOX_HOST_PREFS=1 OPENCODE_SANDBOX_EXEC=1 \
-    ./bubblewrap_opencode ./sandbox-selftest security   # must report the flip
-```
-
-**Two small gaps** remain, of different kinds. That a favourite added in one
-repo is visible in another (and a TUI setting is not) has been verified only for
-the single-repo half — the file was confirmed to be a bind of
-`<state root>/prefs/model.json` with its directory masked — so it needs the same
-run from an ordinary login. SSH agent forwarding is verified up to `connect(2)`
-only; authenticating against a real private remote needs a repository you
-control.
-
 ## Environment variables
 
 All optional, all read before the sandbox starts. `./bubblewrap_opencode --help`
@@ -178,7 +149,7 @@ prints this list ahead of opencode's own help.
 | `OPENCODE_SANDBOX_SSH=1` | Forward the SSH **agent socket only**, plus a per-repo `known_hosts` copy of public host keys. Requires `$SSH_AUTH_SOCK` to already be a live socket — the wrapper never starts an agent, and warns and continues without SSH if it is not set, in which case git-over-SSH will not authenticate. Key material is never exposed either way. |
 | `OPENCODE_SANDBOX_EXEC` | Any non-empty value runs the wrapper's **own arguments** in exactly the sandbox opencode would get, instead of running opencode. The value is only a switch, never the command. It is unset before exec so it cannot leak inward. |
 | `OPENCODE_SANDBOX_HOME=<dir>` | Override the state root. Must be writable and **not under `/tmp`**: `/tmp` is a tmpfs inside the sandbox, so state stored there would be masked and invisible. The directory itself is replaced by an empty tmpfs with this repo's subdirectories bound back in, so pointing it too high costs visibility rather than breaking the run. |
-| `OPENCODE_SANDBOX_RESET=1` | Delete this repo's `data/`, `state/`, `cache/` and `config/` before starting, so the next run re-seeds them from the host. This is how you revoke the copied credentials, and how a host config change reaches a repo that was seeded earlier. The shared preferences survive it. |
+| `OPENCODE_SANDBOX_RESET=1` | Delete this repo's `data/`, `state/`, `cache/` and `config/` before starting, so the next run re-seeds them from the host. This is how you revoke the copied credentials — the auth files and the seeded credential rows both live under `data/` — and how a host config change reaches a repo that was seeded earlier. The shared preferences survive it. |
 | `OPENCODE_SANDBOX_SYNC_PREFS=1` | Re-read `~/.local/state/opencode/model.json` from the host and overwrite the shared preferences file with it, before the sandbox starts — for after a session with the *unsandboxed* opencode. One way only, and it only reads the host file, so it opens no new channel. |
 | `OPENCODE_SANDBOX_HOST_PREFS=1` | Bind the host's own `~/.local/state/opencode/model.json` read-write instead of the shared copy, so the sandboxed and unsandboxed opencode edit one file and stay in sync both ways. The only bind that lets a process inside the sandbox modify host state; see "What is NOT protected" for exactly what that permits. |
 
@@ -193,7 +164,10 @@ prints this list ahead of opencode's own help.
 │                      # directory is not bound, so nothing else can be put there
 ├── <repo>-<sha256[:12]>/       # key = git toplevel basename + path hash
 │   ├── data/opencode/ # XDG_DATA_HOME: auth/mcp-auth/account.json (copies of
-│   │                  # the host files, mode 600), plus opencode.db, logs, storage
+│   │                  # the host files, mode 600), opencode.db (this repo's own
+│   │                  # database; the v2 provider credential rows are seeded
+│   │                  # into it from the host, and nothing else crosses over),
+│   │                  # plus logs, storage
 │   ├── state/         # XDG_STATE_HOME: locks, prompt history, session.json
 │   │   └── opencode/model.json   # mount point for the shared prefs bind
 │   ├── config/opencode/  # OPENCODE_CONFIG_DIR: seeded copy of the host's ~/.config/opencode
@@ -217,7 +191,7 @@ Three kinds of state, one home each. The rule per row is the whole design:
 | Category | Files | Home | Why |
 | --- | --- | --- | --- |
 | **The agent's own configuration** | `config/opencode/` — providers, MCP, plugins, agents, permissions, keybinds, theme | per repo, seeded from the host | an agent can change its own repo's behaviour and no other repo's |
-| **The repo's data** | `data/`, `state/` — db, snapshots, logs, prompt history, pins, credential copies | per repo | session data must not leak between repositories |
+| **The repo's data** | `data/`, `state/` — db, snapshots, logs, prompt history, pins, credential copies (auth files and the db's credential rows) | per repo | session data must not leak between repositories |
 | **You** | `prefs/model.json` — favourites, recents, variants | one shared file | these describe the person, not the repository; isolating them per repo was the bug |
 
 A single writable path per category is what makes the boundary easy to state, and

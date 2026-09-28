@@ -570,6 +570,36 @@ raise SystemExit(0 if n==16 else 1)"
         fi
     done
 
+    # v2 keeps provider API keys in the per-repo database, not in that legacy
+    # file: the file can be intact while every provider request 401s, which is
+    # the bug this row check exists for. Only the credential *rows* are copied,
+    # so the assertion is that this repo's own database holds them; the host's
+    # database itself is asserted absent above. A host with no credentials to
+    # copy, or no sqlite3 to copy with, is an absent subject: n/a, not FAIL.
+    db="$dh/opencode/opencode.db"
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        printf '  %s[ n/a ]%s  sqlite3 not installed; credential rows unverified\n' "$DIM" "$OFF"
+    elif [ ! -s "$dh/opencode/auth.json" ]; then
+        printf '  %s[ n/a ]%s  no host credentials to copy\n' "$DIM" "$OFF"
+    elif [ ! -f "$db" ]; then
+        # Test -f before querying: sqlite3 would *create* a missing database,
+        # and a check must not write to the store it is checking.
+        bad "no opencode.db in $dh/opencode/ to hold credentials"
+    else
+        rows="$(sqlite3 -cmd '.timeout 2000' "$db" 'SELECT COUNT(*) FROM credential' 2>/dev/null)" || rows=""
+        case "$rows" in
+            ''|*[!0-9]*)
+                bad "no credential table in $db (bootstrap did not run?)"
+                ;;
+            0)
+                bad "credential rows missing from $db (providers will 401)"
+                ;;
+            *)
+                ok "seeded provider credentials: $rows row(s) in data/opencode/opencode.db"
+                ;;
+        esac
+    fi
+
     # The host's own model.json must stay hidden at its own path even when the
     # preferences are shared or bound through. The bind only ever *replaces* the
     # file at the per-repo path, so the masked host state directory is still an
