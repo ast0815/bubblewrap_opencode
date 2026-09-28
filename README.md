@@ -42,7 +42,8 @@ rather than failing, so a minimal host is fine.
 | **Key material** | `~/.ssh` is a tmpfs. No private key, `config` or `known_hosts` from the host is ever visible. |
 | **Kernel and namespaces** | `--unshare-all --share-net`, `--unshare-user --disable-userns`, `--cap-drop ALL`, `NoNewPrivs`. Nested user namespaces fail with `ENOSPC`, so a compromised process cannot build a second sandbox. |
 | **Code-execution via PATH** | `~/.bun` and `~/.local/share/uv/tools` are read-only, so a downloaded script cannot be edited into a host-side code-execution path. |
-| **The rest of the filesystem** | `--ro-bind / /`; the only writable host binds are the current working directory and the per-repo state directory. |
+| **The opencode download cache** | `~/.cache/opencode` is read-only. opencode downloads and executes provider packages there, so a writable bind would be a code-execution path into any host-wide opencode service sharing the directory. Each repo gets a seeded copy of its own instead (see below). |
+| **The rest of the filesystem** | `--ro-bind / /`; the only writable host paths are the current working directory and the per-repo state directory. |
 | **Host desktop surface** | `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `XAUTHORITY` and the `XDG_SESSION_*`/`XDG_SEAT*` pointers are unset. |
 
 Hostname inside is `opencode-sandbox`, so a sandboxed process is obvious in
@@ -58,12 +59,6 @@ Read this section before trusting the thing.
   trust the source address. This was a deliberate choice: the agent needs to
   reach model APIs. If you want egress filtering, put it in front of the
   wrapper, not in it.
-- **`~/.cache/opencode/node_modules` is writable and shared.** opencode
-  downloads and executes provider packages at runtime, so this bind has to stay.
-  A compromised sandbox can write there, and the host-wide opencode service
-  executes from the same directory. Two fixes, neither applied: retire that
-  service (the wrapper now always passes `--standalone`, so nothing needs it), or
-  give it a separate `XDG_CACHE_HOME`.
 - **Everything else under `/` is readable.** `--ro-bind / /` hides nothing.
   Other secrets in `$HOME` — other `~/.local/share/*` apps, `~/.gnupg`, browser
   profiles, `~/.config/*/credentials` — are readable and can be exfiltrated
@@ -180,23 +175,32 @@ The writable-bound report is part of the selftest output. Expected shape —
 every line is derived from `$HOME` at runtime, so paths are shown relative to it:
 
 ```
-ro       ~/.bun
-ro       ~/.local/share/uv/tools
-ro       ~/.cache
-tmpfs    ~/.local/state/opencode   (writable, empty, ephemeral)
-tmpfs    ~/.local/share/opencode   (writable, empty, ephemeral)
-tmpfs    ~/.ssh                    (writable, empty, ephemeral)
-WRITABLE ~/.cache/opencode         <-- the known risk above
+ro        ~/.bun
+ro        ~/.local/share/uv/tools
+ro        ~/.cache
+ro        ~/.cache/opencode
+tmpfs     ~/.local/state/opencode   (writable, empty, ephemeral)
+tmpfs     ~/.local/share/opencode   (writable, empty, ephemeral)
+tmpfs     ~/.ssh                    (writable, empty, ephemeral)
+repo-local <state dir>/cache/home   (this repo's own state dir)
 ```
 
-A `WRITABLE` line here is the finding to read, not a cosmetic note: it marks a
-directory where sandbox writes land on a real host filesystem. A `tmpfs` line is
-writable but empty and discarded at exit.
+A `WRITABLE` line naming a path outside the per-repo state directory is the
+finding to read, not a cosmetic note: it marks a directory where sandbox writes
+land on a real host filesystem that something else may also use. A `tmpfs` line
+is writable but empty and discarded at exit.
 
 Read-only package caches are not enough on their own: a `ro` bind looks fine
 until something tries to install into it, so each package manager is redirected
 at a per-repo cache directory via `BUN_INSTALL_CACHE_DIR`, `npm_config_cache`,
 `UV_CACHE_DIR`, `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR` and `PIP_CACHE_DIR`.
+
+`repo-local` is the only expected writable state: writes land in this repo's own
+directory, not in anything shared with the host or with another repo. A red
+`WRITABLE` line naming a path outside it is the finding to watch for. The two
+paths are listed separately on purpose — `XDG_CACHE_HOME` is the per-repo copy
+and must come back writable, while the host's `~/.cache/opencode` must come back
+read-only.
 
 ### Confirmed to work end to end
 
@@ -245,7 +249,7 @@ login to cover the default.
 | --- | --- |
 | `OPENCODE_SANDBOX_SSH=1` | Forward the SSH **agent socket only** (plus a per-repo `known_hosts` copy, public keys). Requires `$SSH_AUTH_SOCK` to already be a live socket — the wrapper never starts an agent, and warns and continues if it is not set. Key material is never exposed either way. |
 | `OPENCODE_SANDBOX_EXEC` | Any non-empty value makes the wrapper run its **own arguments** inside exactly the sandbox opencode would get, instead of running opencode. The value is only a switch, never the command — so `OPENCODE_SANDBOX_EXEC=1 ./bubblewrap_opencode hostname` prints `opencode-sandbox`, and `./bubblewrap_opencode hostname` without it runs opencode and errors. Unset before exec so it cannot leak inward. |
-| `OPENCODE_SANDBOX_HOME=<dir>` | Override the state root. |
+| `OPENCODE_SANDBOX_HOME=<dir>` | Override the state root. Must be writable and **not under `/tmp`**: `/tmp` is a tmpfs inside the sandbox, so a state directory there would be masked and invisible. |
 | `OPENCODE_SANDBOX_RESET=1` | Delete this repo's `data/`, `state/` and `cache/` before starting. This is how you revoke the copied credentials. |
 
 ## State layout
@@ -255,11 +259,34 @@ login to cover the default.
 ├── data/opencode/     # XDG_DATA_HOME: auth.json, mcp-auth.json, account.json (copies of the
 │                      # host files, mode 600), plus opencode.db, storage, logs
 ├── state/             # XDG_STATE_HOME: locks, prompt history, model.json
+├── cache/home/        # XDG_CACHE_HOME: a seeded copy of the host's ~/.cache/opencode
+│   └── .opencode-seeded   # marker, written last, so an interrupted seed re-runs
 ├── cache/{bun,npm,uv,pip}
 ├── tools/bin          # uv tool executables
 ├── ssh/known_hosts    # only when OPENCODE_SANDBOX_SSH=1
 └── meta               # the git toplevel this key came from
 ```
+
+### The seeded cache
+
+`XDG_CACHE_HOME` points at `cache/home` rather than the host's `~/.cache`, so
+opencode's download-and-execute cache is per repo and the host's copy is
+read-only. It moves wholesale rather than just opencode's subdirectory because
+opencode resolves its cache as `$XDG_CACHE_HOME/opencode` and has no separate
+variable for it; anything else following `XDG_CACHE_HOME` is redirected too.
+
+The seed is a one-time copy of the host's `~/.cache/opencode`, taken with
+`cp --reflink=always` where the filesystem supports it. On btrfs and XFS the
+copy shares extents until something writes to one, so it costs essentially
+nothing: measured here, seeding a 505 MB / 35,356-file cache plus a real
+opencode run together cost **0.9 MiB** and about 2.5 s. Where reflink is not
+supported the copy is real, and the wrapper says so on stderr rather than
+letting you discover it as a surprise 505 MB bill. `OPENCODE_SANDBOX_RESET=1`
+discards it along with the rest.
+
+The seed goes to a temporary name and is moved into place, and the marker file
+is written last, so an interrupted seed cannot leave a half-populated cache that
+the marker then vouches for.
 
 It lives outside the repository on purpose: `git clean -fdx` or deleting a
 worktree would otherwise destroy irreplaceable session history. The cost is
@@ -278,3 +305,6 @@ disk, and a one-off re-download per repo.
   deletes them.
 - **`--ro-bind / /` hides nothing.** Read-only is not invisible; see the risk
   list above.
+- **The first run of a repo is slower** — it seeds the cache copy. Reflink makes
+  that cheap on btrfs/XFS and slow on a filesystem without it; the wrapper warns
+  when that is the case.

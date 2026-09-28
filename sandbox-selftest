@@ -133,13 +133,22 @@ if [ "$WHICH" = all ] || [ "$WHICH" = functional ]; then
     rm -f ./.selftest-probe /tmp/.selftest-probe 2>/dev/null
 
     printf '\n  %sbounds that are writable from inside%s\n' "$BOLD" "$OFF"
+    # The wrapper's per-repo state root, recovered from the paths it exported:
+    # XDG_DATA_HOME is $SBX/data, so its grandparent is $SBX.
+    SBX_ROOT="$(dirname "$(dirname "${XDG_DATA_HOME:-/nonexistent/data}")")"
     # Writable is only a problem when the write lands on a real host filesystem.
     # A tmpfs is writable but empty and discarded when the sandbox exits.
-    # $XDG_CACHE_HOME/opencode is included on purpose: it is the one host
-    # directory that *is* writable here (see the README's known risks).
+    #
+    # Both cache paths are listed on purpose. $XDG_CACHE_HOME points at this
+    # repo's own seeded copy, so it *should* come back writable, while the host's
+    # original ~/.cache/opencode must come back read-only -- that one used to be
+    # a writable bind, which was a code-execution path into the host-wide
+    # opencode service sharing the same directory. A WRITABLE line against the
+    # host path is the finding; a WRITABLE line against $XDG_CACHE_HOME is the
+    # expected result.
     for d in "$HOME/.bun" "$HOME/.local/share/uv/tools" "$HOME/.local/state/opencode" \
-             "$HOME/.local/share/opencode" "$HOME/.cache" "$XDG_CACHE_HOME/opencode" \
-             "$HOME/.ssh"; do
+             "$HOME/.local/share/opencode" "$HOME/.cache" "$HOME/.cache/opencode" \
+             "$XDG_CACHE_HOME" "$XDG_CACHE_HOME/opencode" "$HOME/.ssh"; do
         [ -e "$d" ] || continue
         if ! touch "$d/.selftest-probe" 2>/dev/null; then
             printf '    %sro        %s  %s\n' "$GREEN" "$OFF" "$d"
@@ -148,7 +157,17 @@ if [ "$WHICH" = all ] || [ "$WHICH" = functional ]; then
         rm -f "$d/.selftest-probe" 2>/dev/null
         case "$(stat -f -c %T "$d" 2>/dev/null)" in
             tmpfs) printf '    %stmpfs      %s  (writable, but empty and ephemeral)%s\n' "$YELLOW" "$d" "$OFF" ;;
-            *)     printf '    %sWRITABLE   %s  <-- writes reach the host%s\n' "$RED" "$d" "$OFF" ;;
+            *)
+                # A write that lands in this repo's own state directory is the
+                # design, not a finding. A write that lands anywhere else on the
+                # host is. Only the second one is red.
+                case "$d" in
+                    "${SBX_ROOT}"/*)
+                        printf '    %srepo-local %s  (this repo'"'"'s own state dir)%s\n' "$YELLOW" "$d" "$OFF" ;;
+                    *)
+                        printf '    %sWRITABLE   %s  <-- writes reach the host outside this repo%s\n' "$RED" "$d" "$OFF" ;;
+                esac
+                ;;
         esac
     done
     [ -n "${SSH_AUTH_SOCK:-}" ] && printf '    SSH_AUTH_SOCK=%s\n' "$SSH_AUTH_SOCK"
