@@ -91,6 +91,11 @@ Read this section before trusting the thing.
   `model.cycle_favorite` walks — it can steer that picker. It cannot execute
   code, read credentials, or make the host fetch anything: only ids already in
   the host's catalogue have any effect. Off by default.
+- **`OPENCODE_SANDBOX_SSH=1` hands the sandbox a signing oracle.** Not a key —
+  the crypto stays in the agent on the host — but anything inside can ask that
+  agent to authenticate to any host you can reach, repeatedly, and a plain
+  `ssh-agent` will not ask you first. A keyring agent that prompts per use is
+  what keeps this small. See [SSH agent forwarding](#ssh-agent-forwarding).
 - **`/tmp` is RAM-backed and per-invocation.** Writable, but thrown away when the
   sandbox exits. Do not use it to carry state between runs.
 - **The per-repo state directory is on the host disk.** It is keyed on the git
@@ -136,9 +141,6 @@ IANA example domains are unreachable on some networks — so a short candidate
 list is tried and whichever answers is named; any HTTP status counts, including
 401, because the assertion is that the connection was made.
 
-Every claim above was re-measured at the commit that introduced it, except the
-per-repo config and the shared preferences, which came later.
-
 ## Environment variables
 
 All optional, all read before the sandbox starts. `./bubblewrap_opencode --help`
@@ -146,7 +148,7 @@ prints this list ahead of opencode's own help.
 
 | Variable | Effect |
 | --- | --- |
-| `OPENCODE_SANDBOX_SSH=1` | Forward the SSH **agent socket only**, plus a per-repo `known_hosts` copy of public host keys. Requires `$SSH_AUTH_SOCK` to already be a live socket — the wrapper never starts an agent, and warns and continues without SSH if it is not set, in which case git-over-SSH will not authenticate. Key material is never exposed either way. |
+| `OPENCODE_SANDBOX_SSH=1` | Forward the SSH **agent socket only**, plus a per-repo `known_hosts` copy of public host keys. Requires `$SSH_AUTH_SOCK` to already be a live socket — the wrapper never starts an agent, and warns and continues without SSH if it is not set, in which case git-over-SSH will not authenticate. Key material is never exposed either way. How to use it, and the two things it still gets you wrong: [SSH agent forwarding](#ssh-agent-forwarding). |
 | `OPENCODE_SANDBOX_EXEC` | Any non-empty value runs the wrapper's **own arguments** in exactly the sandbox opencode would get, instead of running opencode. The value is only a switch, never the command. It is unset before exec so it cannot leak inward. |
 | `OPENCODE_SANDBOX_HOME=<dir>` | Override the state root. Must be writable and **not under `/tmp`**: `/tmp` is a tmpfs inside the sandbox, so state stored there would be masked and invisible. The directory itself is replaced by an empty tmpfs with this repo's subdirectories bound back in, so pointing it too high costs visibility rather than breaking the run. |
 | `OPENCODE_SANDBOX_RESET=1` | Delete this repo's `data/`, `state/`, `cache/` and `config/` before starting, so the next run re-seeds them from the host. This is how you revoke the copied credentials — the auth files and the seeded credential rows both live under `data/` — and how a host config change reaches a repo that was seeded earlier. The shared preferences survive it. |
@@ -243,6 +245,112 @@ Two warts, documented rather than fixed:
   that path is this repo's, so the two repos take different locks and a
   concurrent toggle can be lost. The file is a few hundred bytes rewritten whole,
   so the outcome is one dropped favourite, never a corrupt file.
+
+## SSH agent forwarding
+
+`OPENCODE_SANDBOX_SSH=1` forwards your **SSH agent socket** into the sandbox so
+git-over-SSH authenticates. It is off by default, and off means absent: with the
+variable unset, `SSH_AUTH_SOCK` still reaches the sandbox but points at nothing
+inside, and `ssh-add -l` answers `Error connecting to agent`.
+
+```sh
+OPENCODE_SANDBOX_SSH=1 ./bubblewrap_opencode              # TUI, agent forwarded
+OPENCODE_SANDBOX_SSH=1 ./bubblewrap_opencode run "push it"
+```
+
+### The agent has to already exist
+
+The wrapper requires `$SSH_AUTH_SOCK` to be a live socket and never starts one.
+Running an agent inside would mean putting a private key inside, which is the
+one thing the `~/.ssh` tmpfs exists to prevent, and an agent started by the
+sandbox would die with it. If the variable is unset, or names a path that is not
+a socket, the wrapper says so and starts the sandbox anyway, without SSH:
+
+```
+bubblewrap_opencode: OPENCODE_SANDBOX_SSH=1 but SSH_AUTH_SOCK is not a live socket; continuing without SSH
+```
+
+Nothing then fails loudly. `git clone git@…` simply fails to authenticate, so if
+a session mysteriously cannot reach a remote, check that line first.
+
+### What you get, and what you do not
+
+| | Inside the sandbox |
+| --- | --- |
+| **Agent socket** | Bound at the **same path** the host uses, so `SSH_AUTH_SOCK` needs no rewriting and `git`, `ssh` and `gh` work unchanged. Verified: `ssh-add -l` from inside lists the agent's keys. |
+| **`known_hosts`** | A per-repo copy at `<state root>/<repo>-<hash>/ssh/known_hosts`, seeded from the host's `~/.ssh/known_hosts` on first use and kept on the host disk from then on, so hosts stay remembered across runs. Handed to git through `GIT_SSH_COMMAND="-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=…"`, which also means a host seen for the first time is accepted rather than prompting. |
+| **Private keys** | Never. `~/.ssh` is a tmpfs and is empty inside; the signing happens in the agent, on the host. |
+| **`~/.ssh/config`** | Never either — it is in the same tmpfs. That has two consequences below. |
+
+Everything above was measured on a host by running the wrapper. A real
+authenticated *push* against a private remote was not exercised, since that
+needs a repository you control.
+
+- **`git` gets the `known_hosts` options, a bare `ssh` does not.** They travel in
+  `GIT_SSH_COMMAND`, which only git reads. Measured inside the sandbox:
+  `git ls-remote git@github.com:…` reports `Host 'github.com' is known and matches
+  the ED25519 host key`, while `ssh -T git@github.com` dies with `Host key
+  verification failed` — the host's `known_hosts` is masked and, without the
+  `-o` options, there is nothing left to check against. Pass them yourself when
+  you need a plain `ssh`: `ssh -o UserKnownHostsFile="$SSH_KNOWN_HOSTS" …`.
+- **Host aliases, `IdentityFile`, `ProxyJump` and non-default ports are gone**,
+  because they are defined in the `config` file that is not there. A remote like
+  `git@work-github:me/repo.git` is taken as the literal hostname `work-github`
+  and fails to resolve. Use the real hostname, or put the setting on the command
+  line.
+
+The switch is all or nothing. There is no per-repo or per-command form of it
+other than not setting the variable for that run.
+
+### What the agent still gives away
+
+The sandbox never sees a key, but a forwarded socket is a **signing oracle**: any
+process inside can ask the agent to authenticate, to any host you can reach, as
+often as it likes. What stands between that and a silent impersonation is the
+agent's own policy, not this wrapper:
+
+- A desktop keyring agent (KWallet, GNOME Keyring) prompts per use, so you see
+  each signature and can refuse it. That prompt is the control that remains, and
+  it is the reason to prefer such an agent here.
+- A plain `ssh-agent` holding added keys signs without asking. The only remaining
+  limits are the key's own constraints — `command=`, `from=`, `restrict` in the
+  *server's* `authorized_keys` — and `--share-net` means the sandbox can also
+  reach whatever trusts your address on the LAN.
+- Revocation is a host-side act: unload the key from the agent, or drop it from
+  `authorized_keys`. Nothing under the per-repo state directory is a credential,
+  which is why `OPENCODE_SANDBOX_RESET=1` does not touch `ssh/`.
+
+### Checking it, and what the selftest will report
+
+Use the wrapper's exec hook to ask the agent itself:
+
+```sh
+OPENCODE_SANDBOX_SSH=1 OPENCODE_SANDBOX_EXEC=1 ./bubblewrap_opencode ssh-add -l
+```
+
+`FUNCTIONALITY` also runs `ssh -V` and prints `SSH_AUTH_SOCK=…` — but that line
+reflects the *variable*, which is inherited either way, so it is not evidence
+that anything was forwarded. `ssh-add -l` is the check.
+
+Then expect `security` to stay green **unless your agent is gpg-agent's**. With
+`SSH_AUTH_SOCK=$XDG_RUNTIME_DIR/gnupg/S.gpg-agent.ssh`, the flag re-opens the
+very socket the selftest asserts is closed:
+
+```
+[ OPEN]  gpg-agent (SSH keys)  →  /run/user/1000/gnupg/S.gpg-agent.ssh
+```
+
+That is the opt-in working as designed, not a regression — but an agent shared
+with gpg-agent cannot also keep that row `[CLOSED]`.
+
+For every other agent location the row stays `[CLOSED]`, and the closing sweep
+("no unlisted socket is connectable") does not count the forwarded socket
+either. That is a property of the sweep, not evidence that nothing was
+forwarded: it enumerates with `find -type s`, and a bind-mounted socket is
+reported by `find` as a **regular file**. Measured inside the sandbox on a
+forwarded agent socket: `find -type s` returns nothing, `find -type f` returns
+it, and `stat` and `connect(2)` both say socket. So a clean `HOST IPC SOCKETS`
+section is not proof that SSH forwarding is off.
 
 ## Gotchas
 
