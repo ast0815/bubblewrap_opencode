@@ -111,11 +111,14 @@ if [ "$WHICH" = all ] || [ "$WHICH" = functional ]; then
     printf '\n  %sbounds that are writable from inside%s\n' "$BOLD" "$OFF"
     # Writable is only a problem when the write lands on a real host filesystem.
     # A tmpfs is writable but empty and discarded when the sandbox exits.
+    # $XDG_CACHE_HOME/opencode is included on purpose: it is the one host
+    # directory that *is* writable here (see the README's known risks).
     for d in "$HOME/.bun" "$HOME/.local/share/uv/tools" "$HOME/.local/state/opencode" \
-             "$HOME/.local/share/opencode" "$HOME/.cache" "$HOME/.ssh"; do
+             "$HOME/.local/share/opencode" "$HOME/.cache" "$XDG_CACHE_HOME/opencode" \
+             "$HOME/.ssh"; do
         [ -e "$d" ] || continue
         if ! touch "$d/.selftest-probe" 2>/dev/null; then
-            printf '    %sro        %s\n' "$GREEN" "$OFF" "$d"
+            printf '    %sro        %s  %s\n' "$GREEN" "$OFF" "$d"
             continue
         fi
         rm -f "$d/.selftest-probe" 2>/dev/null
@@ -214,9 +217,14 @@ raise SystemExit(0 if n==16 else 1)"
              "$HOME/.local/share/opencode/opencode.db" \
              "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa" "$HOME/.ssh/config"; do
         if [ ! -e "$f" ]; then
-            # Distinguish "masked away" from "this host has no such file": if the
-            # containing directory is present but empty, the mask did its job.
-            if [ -d "$(dirname "$f")" ] && [ -z "$(ls -A "$(dirname "$f")" 2>/dev/null)" ]; then
+            # Distinguish "masked away" from "this host has no such file".
+            # A masked directory is a tmpfs, so *any* file missing from it is
+            # hidden. Testing emptiness instead would misreport a file such as
+            # opencode.db as "not on host" merely because the 0-byte masks
+            # sitting in the same tmpfs make the directory non-empty.
+            dir="$(dirname "$f")"
+            if [ -d "$dir" ] && { [ "$(stat -f -c %T "$dir" 2>/dev/null)" = tmpfs ] ||
+                                    [ -z "$(ls -A "$dir" 2>/dev/null)" ]; }; then
                 closed "hidden (dir masked)  $f"
             else
                 printf '  %s[ n/a ]%s  %s (not on host)\n' "$DIM" "$OFF" "$f"
