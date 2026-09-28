@@ -10,6 +10,7 @@ Use it instead of `opencode`:
 ./bubblewrap_opencode                    # TUI
 ./bubblewrap_opencode run "fix the test"
 ./bubblewrap_opencode session list
+./bubblewrap_opencode --help             # what the sandbox does, then opencode's help
 ```
 
 The sandbox is built by the `bubblewrap_opencode` script; `sandbox-selftest` is
@@ -347,6 +348,9 @@ OPENCODE_SANDBOX_HOST_PREFS=1 OPENCODE_SANDBOX_EXEC=1 \
 ```
 
 ## Environment variables
+
+`./bubblewrap_opencode --help` prints a summary of the sandbox followed by this
+list, one line per variable, before opencode's own help.
 
 | Variable | Effect |
 | --- | --- |

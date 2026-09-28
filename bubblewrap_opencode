@@ -15,6 +15,35 @@ CURRENT_FOLDER=${PWD}
 # Resolve the real binary path (follows alternatives, flatpak, etc.)
 REAL_COMMAND="$(readlink -f "$TARGET_EXECUTABLE")"
 
+# Help is answered here, before any state directory exists: it creates nothing,
+# needs no bwrap, and works on a host where the sandbox cannot start. opencode's
+# own help is byte-identical with and without --standalone, so it is delegated
+# as-is instead of going through the argument splitting further down. Only the
+# first argument counts: `models --help` is opencode's subcommand help, and the
+# sandbox blurb would only be noise in it.
+case "${1:-}" in
+    -h|--help)
+        cat <<'EOF'
+bubblewrap_opencode - runs opencode inside a bubblewrap sandbox.
+
+The filesystem is read-only except the current directory and this repo's own
+state; ~/.ssh, the host's opencode data and every other repo's sandbox are not
+visible. Network access is shared with the host.
+
+Environment variables, all optional and read before the sandbox starts:
+
+  OPENCODE_SANDBOX_SSH=1          forward the SSH agent socket only, no key material
+  OPENCODE_SANDBOX_EXEC=1         run the arguments of the wrapper in the sandbox instead of opencode
+  OPENCODE_SANDBOX_HOME=<dir>     where per-repo state lives: writable, and not under /tmp
+  OPENCODE_SANDBOX_RESET=1        delete this repo's sandbox if it exists, then create a new one
+  OPENCODE_SANDBOX_SYNC_PREFS=1   re-read the host's model.json into the shared preferences file
+  OPENCODE_SANDBOX_HOST_PREFS=1   bind the host's model.json read-write instead of the shared copy
+
+EOF
+        exec "${REAL_COMMAND}" "$@"
+        ;;
+esac
+
 # An unset variable must never silently become a bogus bind target, and the
 # value has to be exported as well as used: opencode resolves its own cache from
 # the environment, so binding one directory while the tools look in another
