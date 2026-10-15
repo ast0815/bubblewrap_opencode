@@ -33,6 +33,7 @@ visible. Network access is shared with the host.
 Environment variables, all optional and read before the sandbox starts:
 
   OPENCODE_SANDBOX_SSH=1          forward the SSH agent socket only, no key material
+  OPENCODE_SANDBOX_GH_TOKEN=1     pass the gh CLI's token in as GH_TOKEN, resolved on the host
   OPENCODE_SANDBOX_EXEC=1         run the arguments of the wrapper in the sandbox instead of opencode
   OPENCODE_SANDBOX_HOME=<dir>     where per-repo state lives: writable, and not under /tmp
   OPENCODE_SANDBOX_RESET=1        delete this repo's sandbox if it exists, then create a new one
@@ -164,6 +165,31 @@ if [ "${OPENCODE_SANDBOX_SSH:-0}" = "1" ]; then
         echo "bubblewrap_opencode: OPENCODE_SANDBOX_SSH=1 but SSH_AUTH_SOCK is not a live socket; continuing without SSH" >&2
     fi
 fi
+
+# --- GitHub: the gh CLI's token, when asked -----------------------------------
+# The token never travels as a file: gh consults $GH_TOKEN before any stored
+# credential, so exporting it here is enough and no mount is needed. The
+# resolution happens HERE, in the wrapper on the host, because the token is
+# usually in the desktop keyring (Secret Service / KDE Wallet) and every route
+# to that keyring is one of the sockets masked below - a lookup started inside
+# the sandbox fails, which reads as "The token in default is invalid" in
+# `gh auth status` even though the account metadata in ~/.config/gh/hosts.yml
+# remains readable through --ro-bind / /.
+#
+# Like OPENCODE_SANDBOX_SSH this is a give-away, and the larger one: the active
+# account's token crosses in whole, with every scope the login got (repo,
+# workflow, ...), and nothing prompts per use - there is no agent on the host
+# left to ask. Opt in with OPENCODE_SANDBOX_GH_TOKEN=1; the wrapper never runs
+# `gh auth login`, so gh has to be logged in on the host already for this to
+# find anything.
+if [ "${OPENCODE_SANDBOX_GH_TOKEN:-0}" = "1" ]; then
+    if command -v gh >/dev/null 2>&1 && token="$(gh auth token 2>/dev/null)" && [ -n "$token" ]; then
+        export GH_TOKEN="$token"
+    else
+        echo "bubblewrap_opencode: OPENCODE_SANDBOX_GH_TOKEN=1 but gh is missing or not logged in on the host; continuing without GitHub" >&2
+    fi
+fi
+unset token
 
 export XDG_DATA_HOME="${SBX}/data"    # opencode.db, storage, snapshot, log, tool-output
 # model.json (favourites, recent models, variants) is deliberately *not* per

@@ -96,6 +96,18 @@ Read this section before trusting the thing.
   agent to authenticate to any host you can reach, repeatedly, and a plain
   `ssh-agent` will not ask you first. A keyring agent that prompts per use is
   what keeps this small. See [SSH agent forwarding](#ssh-agent-forwarding).
+- **`OPENCODE_SANDBOX_GH_TOKEN=1` hands the sandbox the gh CLI's token, whole.**
+  Unlike the SSH case there is no agent left on the host — GitHub has no
+  per-use prompt and the token carries every scope the login got (`repo`,
+  `workflow`, `read:org`, `gist` on a default login). Anything inside can use
+  it at will until the token is revoked, from the host, with
+  `gh auth logout -h github.com -u <user>` (or `gh auth refresh`, which rotates
+  the keyring entry). To scope what the sandbox gets, write a dedicated
+  fine-grained PAT and run `GH_TOKEN=... ./bubblewrap_opencode ...`
+  without the flag — an exported `GH_TOKEN` crosses into the sandbox whether
+  the flag is set or not; the flag's only job is resolving the keyring-stored
+  one, which nothing inside can reach. This is why the keyring cut exists and
+  why the route through it is opt-in.
 - **`/tmp` is RAM-backed and per-invocation.** Writable, but thrown away when the
   sandbox exits. Do not use it to carry state between runs.
 - **The per-repo state directory is on the host disk.** It is keyed on the git
@@ -123,7 +135,7 @@ its own argument list in the sandbox instead of opencode. Sections, or `all`
 | `ESCAPE MECHANISMS` | `systemd-run --user`, `nsenter -t 1`, `machinectl`, nested user namespaces, nested bubblewrap, `dmesg`, writing `/proc/sys`, `modprobe`, `mount`, `ptrace` and `process_vm_readv` are all denied. |
 | `HOST FILES` | The host `auth.json`, `mcp-auth.json`, `account.json` and `service.json` read back empty; the host `opencode.db` and the host's `~/.ssh` contents are absent; this repo's credential copy is present and non-empty, and this repo's own `opencode.db` holds at least one provider credential row. A 0-byte mask is openable but empty, so the test is "can I read bytes", not "does `open()` succeed". |
 | `CROSS-REPO ISOLATION` | This repo's own state is writable — asserted first, so a sandbox that masked too much cannot pass by showing nothing — no sibling repo is visible, and the shared preferences directory is masked. |
-| `FUNCTIONALITY`, `OPENCODE CONFIG`, `PREFERENCES` | The toolchain runs, the working directory is writable, git history and DNS and egress work, `/tmp` is writable, the config copy is this repo's own inode and writable with no dangling symlinks, and the preferences file parses and comes from outside this repo's directory. |
+| `FUNCTIONALITY`, `OPENCODE CONFIG`, `PREFERENCES` | The toolchain runs, the working directory is writable, git history and DNS and egress work, `/tmp` is writable, the config copy is this repo's own inode and writable with no dangling symlinks, and the preferences file parses and comes from outside this repo's directory. The GitHub row makes a real authenticated `gh api user` call — it skips on plain runs and asserts only under `OPENCODE_SANDBOX_GH_TOKEN=1`, never classifying the off state as a failure. |
 | `TOOLCHAIN WRITES` | `npm`, `bun`, `uv` and `pip` installs land in per-repo caches, and the read-only toolchain dirs stay read-only. Slow — it downloads packages. |
 
 `FUNCTIONALITY` also prints every writable path in the sandbox, classified as
@@ -149,6 +161,7 @@ prints this list ahead of opencode's own help.
 | Variable | Effect |
 | --- | --- |
 | `OPENCODE_SANDBOX_SSH=1` | Forward the SSH **agent socket only**, plus a per-repo `known_hosts` copy of public host keys. Requires `$SSH_AUTH_SOCK` to already be a live socket — the wrapper never starts an agent, and warns and continues without SSH if it is not set, in which case git-over-SSH will not authenticate. Key material is never exposed either way. How to use it, and the two things it still gets you wrong: [SSH agent forwarding](#ssh-agent-forwarding). |
+| `OPENCODE_SANDBOX_GH_TOKEN=1` | Resolve the **gh CLI's token on the host** — while the keyring is still reachable — and pass it in as `GH_TOKEN`. gh consults the environment before any stored credential, so this needs no mount, and every authenticated `gh` call and git-over-HTTPS push works from inside. Requires gh to already be logged in on the host — the wrapper never runs `gh auth login` — and warns and continues without GitHub otherwise. `gh auth status` with the flag set reports the account as `(GH_TOKEN)`; the selftest asserts with a real `gh api user` call regardless. See "What the agent still gives away" for what this trades. |
 | `OPENCODE_SANDBOX_EXEC` | Any non-empty value runs the wrapper's **own arguments** in exactly the sandbox opencode would get, instead of running opencode. The value is only a switch, never the command. It is unset before exec so it cannot leak inward. |
 | `OPENCODE_SANDBOX_HOME=<dir>` | Override the state root. Must be writable and **not under `/tmp`**: `/tmp` is a tmpfs inside the sandbox, so state stored there would be masked and invisible. The directory itself is replaced by an empty tmpfs with this repo's subdirectories bound back in, so pointing it too high costs visibility rather than breaking the run. |
 | `OPENCODE_SANDBOX_RESET=1` | Delete this repo's `data/`, `state/`, `cache/` and `config/` before starting, so the next run re-seeds them from the host. This is how you revoke the copied credentials — the auth files and the seeded credential rows both live under `data/` — and how a host config change reaches a repo that was seeded earlier. The shared preferences survive it. |

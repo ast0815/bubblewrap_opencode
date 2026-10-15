@@ -187,6 +187,21 @@ if [ "$WHICH" = all ] || [ "$WHICH" = functional ]; then
     run "git"                           - git --version
     run "python3"                       - python3 --version
     run "ssh"                           - ssh -V
+    # GitHub only when the wrapper was asked to hand a token in. The assertion
+    # is a real authenticated call rather than `gh auth status`: the env token
+    # is what commands use, and gh 2.102 happens to report it back as
+    # "(GH_TOKEN)" in status -- but only versions recent enough; an API call
+    # is the honest probe. And a plain run must pass without the flag: unset
+    # GH_TOKEN is the off state, not a regression, so it skips - never FAIL.
+    if [ -n "${GH_TOKEN:-}" ]; then
+        if command -v gh >/dev/null 2>&1; then
+            run "github token authenticates"    - gh api user -q .login
+        else
+            printf '  %s[ n/a ]%s  github token: gh not installed\n' "$DIM" "$OFF"
+        fi
+    else
+        printf '  %s[skip]%s  github token (GH_TOKEN unset; run the wrapper with OPENCODE_SANDBOX_GH_TOKEN=1)\n' "$DIM" "$OFF"
+    fi
     run "working dir is writable"       - touch ./.selftest-probe
     run "git history readable"          - git log --oneline -1
     run "filesystem is readable"        - ls /usr/bin
