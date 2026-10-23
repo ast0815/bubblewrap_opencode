@@ -99,10 +99,11 @@ just documentation — read it before changing behaviour.
   (`bind_root`) and matches on the repo *key* or a path *suffix* — never a full
   prefix, because the mount root is filesystem-relative (`/@home/lukas/…` on
   this btrfs subvolume). New report rows must follow that convention.
-- `--standalone` (opencode v2.0.11 here, gated on `*v[2-9].*`): belongs *after*
-  the subcommand path, acceptance is per **leaf** command, the verdict is cached
-  in `<state root>/.standalone-flags`, and the subcommand path is the leading run
-  of non-flag args capped at 3 words so `run "long message"` is not split.
+- `--standalone` (gated on `*v[2-9].*`): belongs *after* the subcommand path, and
+  not every command accepts it. The table is hard-coded from the v2.1.2 help
+  output and is a deny list, so an unknown command gets the flag; re-check it
+  when opencode is upgraded. `auth` and `session` are the only commands whose
+  second word is part of the path.
 - Checks whose subject is absent must report `[ n/a ]` or a skip, never `FAIL`,
   so a minimal host still passes.
 

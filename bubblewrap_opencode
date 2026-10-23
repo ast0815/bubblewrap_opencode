@@ -764,38 +764,40 @@ fi
 # actually contains the server instead of having the client delegate to a
 # service running outside the bwrap.
 #
-# Three things about this flag are easy to get wrong, and all three were wrong
-# here:
+# The flag belongs *after* the subcommand path: `opencode --standalone models`
+# is rejected and prints help, `opencode models --standalone` works. It is also
+# not accepted everywhere. The table below was read off the v2.1.2 help output
+# and is a deny list on purpose: a command that does not take the flag prints
+# help (loud), while omitting it where it is accepted lets the client delegate
+# to the host service (silent). An unknown command therefore gets the flag.
+# Re-check the table when opencode is upgraded.
 #
-#   - It belongs *after* the subcommand path. `opencode --standalone models`
-#     is rejected and prints help; `opencode models --standalone` works.
-#   - It is not accepted by every command. serve, session, auth, debug, mcp,
-#     plugin, upgrade, uninstall, service, acp and pair make opencode print its
-#     help and do nothing.
-#   - Acceptance is per *leaf* command, not per top-level one: `session` has no
-#     such flag, but `session list` does.
-#
-# So the argument list is split into the subcommand path and the rest, the
-# binary is asked whether that exact path accepts the flag, and the answer is
-# cached per version because each question costs a process start.
-# OPENCODE_VERSION and want_standalone are computed in the credentials
-# section above, where the credential-row seed needs them too.
-OPENCODE_VERSION="${OPENCODE_VERSION:-}"
-want_standalone="${want_standalone:-0}"
-
-# The leading run of non-flag arguments is the subcommand path. Anything longer
-# than three words is a command's own arguments (`run "some long message"`), so
-# fall back to the first word alone rather than splitting a message in half.
+# Only `auth` and `session` have a subcommand as their second word. Depth
+# matters only where the flag is inserted: for `debug`, `mcp` and `plugin` the
+# final argv is the same either way.
 path=()
 if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
-    for a in "$@"; do
-        [ "${a#-}" = "$a" ] || break
-        path+=("$a")
-    done
-    if [ "${#path[@]}" -gt 3 ]; then
-        path=("${path[0]}")
-    fi
+    path=("$1")
+    case "$1" in
+        auth|session)
+            if [ "$#" -gt 1 ] && [ "${2#-}" = "$2" ]; then
+                path+=("$2")
+            fi
+            ;;
+    esac
 fi
+
+verdict=yes
+case "${path[0]:-}" in
+    upgrade|update|uninstall|acp|service|pair|serve|debug|mcp|plugin)
+        verdict=no
+        ;;
+    auth|session)
+        if [ "${#path[@]}" -eq 1 ]; then
+            verdict=no
+        fi
+        ;;
+esac
 
 opencode_args=("$REAL_COMMAND")
 if [ "$want_standalone" = 1 ]; then
@@ -803,27 +805,6 @@ if [ "$want_standalone" = 1 ]; then
         # No subcommand at all: this is the TUI, which does accept the flag.
         opencode_args+=(--standalone)
     else
-        flag_cache="${SBX_PARENT}/.standalone-flags"
-        key="${OPENCODE_VERSION} ${path[*]}"
-        verdict=""
-        if [ -r "${flag_cache}" ]; then
-            # Whole-line match: the key itself contains spaces, and a prefix
-            # match would let `run` match a cached `runner`.
-            if grep -qxF -- "${key} yes" "${flag_cache}" 2>/dev/null; then
-                verdict=yes
-            elif grep -qxF -- "${key} no" "${flag_cache}" 2>/dev/null; then
-                verdict=no
-            fi
-        fi
-        if [ -z "$verdict" ]; then
-            if "$REAL_COMMAND" "${path[@]}" --help 2>&1 \
-                 | sed -n '/^FLAGS/,/^GLOBAL/p' | grep -q -- '--standalone'; then
-                verdict=yes
-            else
-                verdict=no
-            fi
-            printf '%s %s\n' "$key" "$verdict" >> "${flag_cache}" 2>/dev/null || true
-        fi
         opencode_args+=("${path[@]}")
         if [ "$verdict" = yes ]; then
             opencode_args+=(--standalone)
