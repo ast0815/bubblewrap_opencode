@@ -807,10 +807,13 @@ if [ "$want_standalone" = 1 ]; then
         key="${OPENCODE_VERSION} ${path[*]}"
         verdict=""
         if [ -r "${flag_cache}" ]; then
-            case "$(grep -m1 -F "${key} " "${flag_cache}" 2>/dev/null)" in
-                " ${key} yes") verdict=yes ;;
-                " ${key} no")  verdict=no ;;
-            esac
+            # Whole-line match: the key itself contains spaces, and a prefix
+            # match would let `run` match a cached `runner`.
+            if grep -qxF -- "${key} yes" "${flag_cache}" 2>/dev/null; then
+                verdict=yes
+            elif grep -qxF -- "${key} no" "${flag_cache}" 2>/dev/null; then
+                verdict=no
+            fi
         fi
         if [ -z "$verdict" ]; then
             if "$REAL_COMMAND" "${path[@]}" --help 2>&1 \
