@@ -120,6 +120,17 @@ denied() {
     fi
 }
 
+# cwd_is_home_or_above — 0 when the working directory is $HOME or a parent of it.
+# The wrapper mounts that case read-only unless OPENCODE_SANDBOX_HOME_RW=1, so
+# the expectations below are derived from the same condition.
+cwd_is_home_or_above() {
+    local cwd home
+    cwd="$(pwd -P)"
+    home="$(readlink -f -- "$HOME" 2>/dev/null || printf '%s' "$HOME")"
+    case "${home}/" in "${cwd%/}/"*) return 0 ;; esac
+    return 1
+}
+
 # The wrapper's per-repo state root, recovered from the path it exported:
 # XDG_DATA_HOME is $SBX/data, so its parent is $SBX.
 #
@@ -202,8 +213,16 @@ if [ "$WHICH" = all ] || [ "$WHICH" = functional ]; then
     else
         printf '  %s[skip]%s  github token (GH_TOKEN unset; run the wrapper with OPENCODE_SANDBOX_GH_TOKEN=1)\n' "$DIM" "$OFF"
     fi
-    run "working dir is writable"       - touch ./.selftest-probe
-    run "git history readable"          - git log --oneline -1
+    if cwd_is_home_or_above && [ "${OPENCODE_SANDBOX_HOME_RW:-0}" != 1 ]; then
+        printf '  %s[ n/a ]%s  working dir is HOME or above it: read-only (see WORKING DIRECTORY AND HOME)\n' "$DIM" "$OFF"
+    else
+        run "working dir is writable"   - touch ./.selftest-probe
+    fi
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        run "git history readable"      - git log --oneline -1
+    else
+        printf '  %s[ n/a ]%s  git history: working dir is not a git repository\n' "$DIM" "$OFF"
+    fi
     run "filesystem is readable"        - ls /usr/bin
     run "HOME is readable"              - ls "$HOME"
     run "user lookup works (nsswitch)"  - getent passwd "$(id -un)"
@@ -635,6 +654,28 @@ raise SystemExit(0 if n==16 else 1)"
     else
         printf '  %s[ n/a ]%s  ~/.config/opencode/cli.json (not on host)\n' "$DIM" "$OFF"
     fi
+
+    # The working directory is the one writable host path, so what it contains
+    # decides what is writable. Home is read-only by default; the opt-in makes it
+    # writable, and the host's two caches stay read-only either way.
+    section "WORKING DIRECTORY AND HOME (what the sandbox may write)"
+    if cwd_is_home_or_above; then
+        if [ "${OPENCODE_SANDBOX_HOME_RW:-0}" = 1 ]; then
+            run "working dir is HOME or above it: writable, by opt-in" - touch ./.selftest-probe
+            rm -f ./.selftest-probe 2>/dev/null
+        else
+            denied "working dir is HOME or above it: read-only" touch ./.selftest-probe
+        fi
+    else
+        printf '  %s[ n/a ]%s  working dir is neither HOME nor a parent of it; subdirectories are writable\n' "$DIM" "$OFF"
+    fi
+    for d in "$HOME/.cache" "$HOME/.config/opencode"; do
+        if [ -d "$d" ]; then
+            denied "not writable: ${d/#$HOME/~}" test -w "$d"
+        else
+            printf '  %s[ n/a ]%s  %s (not on host)\n' "$DIM" "$OFF" "${d/#$HOME/~}"
+        fi
+    done
 
     # Cross-repo isolation, stated as a measurement rather than an assumption.
     # The state root holds one directory per repo, and each of those contains a

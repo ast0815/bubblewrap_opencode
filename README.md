@@ -42,7 +42,7 @@ so a minimal host is fine.
 | **Kernel and namespaces** | `--unshare-all --share-net`, `--unshare-user --disable-userns`, `--cap-drop ALL`, `NoNewPrivs`, `--new-session`. Nested user namespaces fail with `ENOSPC`, so a compromised process cannot build a second sandbox. |
 | **Code execution via PATH** | `~/.bun` and `~/.local/share/uv/tools` are read-only, so a downloaded script cannot be edited into a host-side code-execution path. The package managers are redirected at per-repo caches so installing still works. |
 | **opencode's cache and config** | The host's `~/.cache/opencode` is read-only — opencode downloads and executes provider packages there — and so is `~/.config/opencode`, whose `cli.json` the TUI writes and into which plugins install. Each repo gets a seeded copy of each, via `XDG_CACHE_HOME` and `OPENCODE_CONFIG_DIR`. |
-| **The rest of the filesystem** | `--ro-bind / /`. The only writable host paths are the working directory, this repo's state, and one shared preferences *file*; the state root holding the latter is itself masked. `/tmp` is a fresh tmpfs. |
+| **The rest of the filesystem** | `--ro-bind / /`. The writable host paths are the working directory, this repo's state, and one shared preferences *file*; the state root holding the latter is itself masked. A working directory that is `$HOME` or a parent of it (such as `/home`) is read-only unless `OPENCODE_SANDBOX_HOME_RW=1`. Subdirectories of home are writable as usual, and `/` is refused outright. `/tmp` is a fresh tmpfs. |
 | **Host desktop surface** | `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `XAUTHORITY` and the `XDG_SESSION_*`/`XDG_SEAT*` pointers are unset, so nothing blocks for seconds on a socket that no longer exists. |
 
 Hostname inside is `opencode-sandbox`, so a sandboxed process is obvious in
@@ -83,6 +83,17 @@ Read this section before trusting the thing.
   the repository, and per-repo favourites were the bug that prompted this. The
   *directory* holding the file is not bound and is masked along with the rest of
   the state root, so there is nothing to enumerate through it.
+- **`OPENCODE_SANDBOX_HOME_RW=1` makes your home directory writable.** Off by
+  default. The working directory is then all of `$HOME`, so the sandbox can write
+  the files the host runs or reads later: `~/.bashrc` and `~/.zshrc`, which later
+  shells source; the dotfiles that are symlinks into `~/profile`; the playbook
+  behind `~/.config/opencode/opencode.json`, which the unsandboxed opencode reads,
+  so an added MCP server or plugin would run on the host; this wrapper; every
+  repo's `.git/hooks`. Files under home can also be overwritten or deleted,
+  including `Documents`, `Downloads` and the `Nextcloud` folder, where deletions
+  sync. `~/.cache` and `~/.config/opencode` are re-bound read-only, and the masks
+  and the other repos stay hidden as before. Use it when you want to edit files in
+  home; otherwise run from a subdirectory such as `~/scratch`.
 - **`OPENCODE_SANDBOX_HOST_PREFS=1` makes the host's `model.json` writable too.**
   That is the only bind in this wrapper that lets a process inside modify host
   state, and it buys two-way sync with your unsandboxed opencode. An agent can
@@ -135,7 +146,8 @@ its own argument list in the sandbox instead of opencode. Sections, or `all`
 | `ESCAPE MECHANISMS` | `systemd-run --user`, `nsenter -t 1`, `machinectl`, nested user namespaces, nested bubblewrap, `dmesg`, writing `/proc/sys`, `modprobe`, `mount`, `ptrace` and `process_vm_readv` are all denied. |
 | `HOST FILES` | The host `auth.json`, `mcp-auth.json`, `account.json` and `service.json` read back empty; the host `opencode.db` and the host's `~/.ssh` contents are absent; this repo's credential copy is present and non-empty, and this repo's own `opencode.db` holds at least one provider credential row. A 0-byte mask is openable but empty, so the test is "can I read bytes", not "does `open()` succeed". |
 | `CROSS-REPO ISOLATION` | This repo's own state is writable — asserted first, so a sandbox that masked too much cannot pass by showing nothing — no sibling repo is visible, and the shared preferences directory is masked. |
-| `FUNCTIONALITY`, `OPENCODE CONFIG`, `PREFERENCES` | The toolchain runs, the working directory is writable, git history and DNS and egress work, `/tmp` is writable, the config copy is this repo's own inode and writable with no dangling symlinks, and the preferences file parses and comes from outside this repo's directory. The GitHub row makes a real authenticated `gh api user` call — it skips on plain runs and asserts only under `OPENCODE_SANDBOX_GH_TOKEN=1`, never classifying the off state as a failure. |
+| `WORKING DIRECTORY AND HOME` | When the working directory is `$HOME` or a parent of it, it is read-only, or writable only under `OPENCODE_SANDBOX_HOME_RW=1`. A subdirectory of home is writable as usual. `~/.cache` and `~/.config/opencode` are read-only in every mode. |
+| `FUNCTIONALITY`, `OPENCODE CONFIG`, `PREFERENCES` | The toolchain runs, the working directory is writable (or read-only by design when it is `$HOME` or a parent of it), git history and DNS and egress work, `/tmp` is writable, the config copy is this repo's own inode and writable with no dangling symlinks, and the preferences file parses and comes from outside this repo's directory. The GitHub row makes a real authenticated `gh api user` call — it skips on plain runs and asserts only under `OPENCODE_SANDBOX_GH_TOKEN=1`, never classifying the off state as a failure. |
 | `TOOLCHAIN WRITES` | `npm`, `bun`, `uv` and `pip` installs land in per-repo caches, and the read-only toolchain dirs stay read-only. Slow — it downloads packages. |
 
 `FUNCTIONALITY` also prints every writable path in the sandbox, classified as
@@ -164,6 +176,7 @@ prints this list ahead of opencode's own help.
 | `OPENCODE_SANDBOX_GH_TOKEN=1` | Resolve the **gh CLI's token on the host** — while the keyring is still reachable — and pass it in as `GH_TOKEN`. gh consults the environment before any stored credential, so this needs no mount, and every authenticated `gh` call and git-over-HTTPS push works from inside. Requires gh to already be logged in on the host — the wrapper never runs `gh auth login` — and warns and continues without GitHub otherwise. `gh auth status` with the flag set reports the account as `(GH_TOKEN)`; the selftest asserts with a real `gh api user` call regardless. See "What the agent still gives away" for what this trades. |
 | `OPENCODE_SANDBOX_EXEC` | Any non-empty value runs the wrapper's **own arguments** in exactly the sandbox opencode would get, instead of running opencode. The value is only a switch, never the command. It is unset before exec so it cannot leak inward. |
 | `OPENCODE_SANDBOX_HOME=<dir>` | Override the state root. Must be writable and **not under `/tmp`**: `/tmp` is a tmpfs inside the sandbox, so state stored there would be masked and invisible. The directory itself is replaced by an empty tmpfs with this repo's subdirectories bound back in, so pointing it too high costs visibility rather than breaking the run. |
+| `OPENCODE_SANDBOX_HOME_RW=1` | Make a working directory that is `$HOME` or a parent of it writable. Off by default, so running from home gives a read-only sandbox with the favourites and the masks intact. This exposes your dotfiles and everything else under home; see "What is NOT protected" for the list. |
 | `OPENCODE_SANDBOX_RESET=1` | Delete this repo's `data/`, `state/`, `cache/` and `config/` before starting, so the next run re-seeds them from the host. This is how you revoke the copied credentials — the auth files and the seeded credential rows both live under `data/` — and how a host config change reaches a repo that was seeded earlier. The shared preferences survive it. |
 | `OPENCODE_SANDBOX_SYNC_PREFS=1` | Re-read `~/.local/state/opencode/model.json` from the host and overwrite the shared preferences file with it, before the sandbox starts — for after a session with the *unsandboxed* opencode. One way only, and it only reads the host file, so it opens no new channel. |
 | `OPENCODE_SANDBOX_HOST_PREFS=1` | Bind the host's own `~/.local/state/opencode/model.json` read-write instead of the shared copy, so the sandboxed and unsandboxed opencode edit one file and stay in sync both ways. The only bind that lets a process inside the sandbox modify host state; see "What is NOT protected" for exactly what that permits. |

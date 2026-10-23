@@ -69,6 +69,11 @@ just documentation — read it before changing behaviour.
   one underneath `--ro-bind / /`. That is why the `hide_dirs` loop does
   `mkdir -p` and why `mkdir -p "${SBX}/state/opencode"` precedes the `model.json`
   bind. Every new tmpfs target needs the same.
+- The working-directory bind (`cwd_args`) comes right after `--ro-bind / /`, with
+  `--tmpfs /tmp` just before it. A later mount hides an earlier one beneath it:
+  bound last, a working directory that was `$HOME` (or a parent of it) hid every mask under it,
+  and a working directory under `/tmp` is hidden by a `/tmp` tmpfs mounted after
+  it. Never move it after a mask or after `/tmp`.
 - Each 0-byte mask needs its own fd (`exec {fd}</dev/null` per call); bwrap
   consumes them.
 - `OPENCODE_SANDBOX_HOME` must be writable and **not under `/tmp`**. The

@@ -30,12 +30,18 @@ The filesystem is read-only except the current directory and this repo's own
 state; ~/.ssh, the host's opencode data and every other repo's sandbox are not
 visible. Network access is shared with the host.
 
+The current directory is the one writable host path. Running from / is refused.
+A current directory that is your home directory, or a parent of it such as /home,
+is read-only unless OPENCODE_SANDBOX_HOME_RW=1 is set. Subdirectories of home
+are writable as usual.
+
 Environment variables, all optional and read before the sandbox starts:
 
   OPENCODE_SANDBOX_SSH=1          forward the SSH agent socket only, no key material
   OPENCODE_SANDBOX_GH_TOKEN=1     pass the gh CLI's token in as GH_TOKEN, resolved on the host
   OPENCODE_SANDBOX_EXEC=1         run the arguments of the wrapper in the sandbox instead of opencode
   OPENCODE_SANDBOX_HOME=<dir>     where per-repo state lives: writable, and not under /tmp
+  OPENCODE_SANDBOX_HOME_RW=1      make a current directory that is $HOME, or a parent of it, writable
   OPENCODE_SANDBOX_RESET=1        delete this repo's sandbox if it exists, then create a new one
   OPENCODE_SANDBOX_SYNC_PREFS=1   re-read the host's model.json into the shared preferences file
   OPENCODE_SANDBOX_HOST_PREFS=1   bind the host's model.json read-write instead of the shared copy
@@ -62,6 +68,25 @@ XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR%/}"
 # variable has to reach them -- and with `set -u` in the selftest, a missing one
 # aborts the run instead of reporting a verdict.
 export XDG_RUNTIME_DIR
+
+# --- What the sandbox may write -----------------------------------------------
+# The current directory is the one host path that is writable, so what it
+# contains decides how much is. / is refused outright: a writable root hands
+# back the host's control plane and every credential masked below. A current
+# directory that is $HOME, or a parent of it such as /home, is read-only unless
+# asked otherwise, because home holds what the host runs later: shell startup
+# files, the dotfiles repo they link into, this wrapper, and every other repo's
+# git hooks. Subdirectories of home are writable like any other directory.
+CWD_REAL="$(readlink -f -- "${CURRENT_FOLDER}" 2>/dev/null || printf '%s' "${CURRENT_FOLDER}")"
+HOME_REAL="$(readlink -f -- "${HOME}" 2>/dev/null || printf '%s' "${HOME}")"
+if [ "${CWD_REAL}" = "/" ]; then
+    echo "bubblewrap_opencode: refusing to run with / as the working directory; cd into a project first" >&2
+    exit 1
+fi
+cwd_is_home_or_above=0
+case "${HOME_REAL}/" in
+    "${CWD_REAL%/}/"*) cwd_is_home_or_above=1 ;;
+esac
 
 # --- Persistent state, one directory per repo -------------------------------
 # Sessions must survive between runs of this wrapper, but must not live inside
@@ -591,6 +616,23 @@ if [ "${OPENCODE_SANDBOX_HOST_PREFS:-0}" = "1" ]; then
     fi
 fi
 
+# The current directory: read-only if it is $HOME or a parent of it, writable
+# otherwise. bwrap applies mounts in order and a later mount hides an earlier one
+# beneath it, so this must come before every mask and per-repo bind; /tmp is a
+# fresh tmpfs and comes before it, so a current directory under /tmp stays visible.
+cwd_args=(--bind "${CURRENT_FOLDER}" "${CURRENT_FOLDER}")
+if [ "${cwd_is_home_or_above}" = 1 ]; then
+    if [ "${OPENCODE_SANDBOX_HOME_RW:-0}" = "1" ]; then
+        echo "bubblewrap_opencode: OPENCODE_SANDBOX_HOME_RW=1: ${CURRENT_FOLDER} is writable, including your dotfiles and anything a later shell runs" >&2
+        # Home is writable now, but these two stay read-only, as they are everywhere else.
+        cwd_args+=(--ro-bind-try "${HOME}/.cache" "${HOME}/.cache"
+                   --ro-bind-try "${HOME}/.config/opencode" "${HOME}/.config/opencode")
+    else
+        echo "bubblewrap_opencode: ${CURRENT_FOLDER} is your home directory or a parent of it, so it is read-only; set OPENCODE_SANDBOX_HOME_RW=1 to make it writable" >&2
+        cwd_args=()
+    fi
+fi
+
 # Build the full bwrap argument array
 bwrap_args=(
     bwrap
@@ -624,6 +666,10 @@ bwrap_args=(
 
     # Mount the whole file system read-only
     --ro-bind   / /
+
+    # A fresh /tmp, then the current directory on top of it (see cwd_args above).
+    --tmpfs /tmp
+    ${cwd_args[@]+"${cwd_args[@]}"}
 
     # Cut the host control plane. Every socket hidden here is a way for a
     # process in the sandbox to have the *host* act on its behalf:
@@ -671,9 +717,6 @@ bwrap_args=(
     --dev /dev
     --proc /proc
 
-    # Add some temporary file systems
-    --tmpfs /tmp
-
     # SSH: no key material, ever. ~/.ssh is one of the tmpfs mounts above, so
     # private keys, config and known_hosts are gone. Agent forwarding, when
     # enabled, is bound in *after* the mask, so the socket survives it.
@@ -694,9 +737,6 @@ bwrap_args=(
     # OPENCODE_SANDBOX_HOST_PREFS=1, which makes the host's model.json writable
     # on purpose so the sandboxed and unsandboxed opencode share it. It is a
     # model id list and nothing else; the reasoning is in full at that bind.
-
-    # Make the current directory writable
-    --bind "${CURRENT_FOLDER}" "${CURRENT_FOLDER}"
 )
 
 # The host's desktop and secret services are unreachable above, so stop
