@@ -174,7 +174,7 @@ fi
 # --- GitHub: the gh CLI's token, when asked -----------------------------------
 # The token is resolved here, on the host: the keyring sockets are masked
 # inside. It travels in the environment, not a file. This is a large give-away;
-# see AGENTS.md. The wrapper never runs `gh auth login`.
+# see DESIGN.md. The wrapper never runs `gh auth login`.
 if [ "${OPENCODE_SANDBOX_GH_TOKEN:-0}" = "1" ]; then
     if command -v gh >/dev/null 2>&1 && token="$(gh auth token 2>/dev/null)" && [ -n "$token" ]; then
         export GH_TOKEN="$token"

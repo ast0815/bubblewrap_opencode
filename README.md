@@ -12,7 +12,7 @@ Use it instead of `opencode`:
 
 `bubblewrap_opencode` builds the sandbox; `sandbox-selftest` measures it from
 inside. Design notes, threat model and verification live in
-[AGENTS.md](AGENTS.md).
+[DESIGN.md](DESIGN.md).
 
 ## Filesystem
 
